@@ -80,6 +80,7 @@ X=[ones(size(Dx)),Dx,Age,Sex,Edu,Motion];
 Z={ones(size(Dx)),Dx};
 G={Site,Site};
 
+save('Stat_Sub_Info_848vs794','SubID','Dx','Age','Sex','Edu','Motion','Site')
 
 %Nodal Degree
 TMatrix = zeros(size(ROICorrelation_FisherZ_Set,2),1);
@@ -539,5 +540,11 @@ G={Site,Site};
 
 
 
+%Cohen's d
+T=TMatrix(7,7)
+n1=848;n2=794;
+df=1636;
+d=T*(n1+n2)/sqrt(df)/sqrt(n1*n2)
 
+r=sqrt(t*t/(t*t+df))
 
