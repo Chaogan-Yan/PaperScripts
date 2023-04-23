@@ -25,3 +25,6 @@ Shen, Y.-Q., Zhou, H.-X., Chen, X., Castellanos, F.X., Yan, C.-G. (2020). Medita
 ## Yan_2019_PNAS: 
 Yan, C.G., Chen, X., Li, L., Castellanos, F.X., Bai, T.J., Bo, Q.J., Cao, J., Chen, G.M., Chen, N.X., Chen, W., Cheng, C., Cheng, Y.Q., Cui, X.L., Duan, J., Fang, Y.R., Gong, Q.Y., Guo, W.B., Hou, Z.H., Hu, L., Kuang, L., Li, F., Li, K.M., Li, T., Liu, Y.S., Liu, Z.N., Long, Y.C., Luo, Q.H., Meng, H.Q., Peng, D.H., Qiu, H.T., Qiu, J., Shen, Y.D., Shi, Y.S., Wang, C.Y., Wang, F., Wang, K., Wang, L., Wang, X., Wang, Y., Wu, X.P., Wu, X.R., Xie, C.M., Xie, G.R., Xie, H.Y., Xie, P., Xu, X.F., Yang, H., Yang, J., Yao, J.S., Yao, S.Q., Yin, Y.Y., Yuan, Y.G., Zhang, A.X., Zhang, H., Zhang, K.R., Zhang, L., Zhang, Z.J., Zhou, R.B., Zhou, Y.T., Zhu, J.J., Zou, C.J., Si, T.M., Zuo, X.N., Zhao, J.P., Zang, Y.F. (2019). Reduced default mode network functional connectivity in patients with recurrent major depressive disorder. Proc Natl Acad Sci U S A, 116(18), 9078-9083, doi:10.1073/pnas.1900390116.
 
+## WangYW_2023_NeuroImage:
+Wang, Y.W., Chen, X., Yan, C.G. (2023). Comprehensive evaluation of harmonization on functional brain imaging for multisite data-fusion. Neuroimage, 120089, doi:10.1016/j.neuroimage.2023.120089.
+
