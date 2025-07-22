@@ -1,0 +1,9 @@
+singularity pull docker://cgyan/ibcdr_enigma_stats
+
+
+singularity shell -B /mnt/Data45/RfMRILab/yan/YAN_Work/REST-meta-MDD_Surf/ENIGMA_RMD/Data:/data ibcdr_enigma_stats.simg /opt/ENIGMA_RMD_Vertex_Stats_StandAlone/run_ENIGMA_RMD_Vertex_Stats_StandAlone.sh /opt/mcr/v98 /data /data/ENIGMA_RMD_Covariates_Data.xlsx 10 8 1
+
+
+
+
+
