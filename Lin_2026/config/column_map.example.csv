@@ -1,0 +1,6 @@
+source_name,canonical_name
+participant_id,SubID
+diagnosis_code,subtype
+age_years,Age
+sex_code,Sex
+estimated_total_intracranial_volume,EstimatedTotalIntraCranialVol

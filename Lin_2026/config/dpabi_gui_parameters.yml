@@ -1,0 +1,97 @@
+project:
+  manuscript: "MDD hippocampal/amygdala multimodal analysis"
+  dpabi_release_check_cutoff: "2026-04-30"
+
+software:
+  dpabi_version: "DPABI_V9.0_250415"
+  dpabisurf_version: "3.3"
+  matlab_release: "R2020a"
+  operating_system: "Ubuntu 18.04"
+  dpabi_version_source: "https://rfmri.org/dpabi"
+  gui_tutorial: "https://edu.deepbrain.com/RFMRICourse"
+
+direct_source_preprocessing:
+  protocol: "DIRECT Phase II standardized DPABISurf pipeline; see manuscript Methods"
+  fmriprep_version: "20.0.1"
+  freesurfer_reconstruction_version: "6.0.1"
+  freesurfer_subregion_segmentation_version: "7.4.1"
+
+structural_combat:
+  module: "DPABI Harmonization"
+  method: "ComBat"
+  parametric: true
+  batch: "site"
+  preserved_covariates: ["age", "sex", "eTIV", "diagnosis"]
+
+falff_combat:
+  enabled: true
+  level: "voxelwise_maps"
+  module: "DPABI Harmonization"
+  method: "ComBat"
+  parametric: true
+  batch: "site"
+  preserved_covariates: ["age", "sex", "mean_FD", "diagnosis"]
+  mask: "DPABI/Templates/BrainMask_05_97x115x97.nii"
+
+fc_calculation:
+  module: "DPABI seed-based functional connectivity"
+  input_directory_name: "FunVoluGlobal"
+  based_on_funsurf: true
+  functional_sessions: 1
+  parallel_workers: 0
+  remove_first_timepoints_in_this_gui_run: 0
+  normalize_to_voxel_size_mm: [2, 2, 2]
+  seed_count: 4
+  seed_manifest: "config/fc_seed_manifest.csv"
+  seed_names:
+    - "Right_Basal_nucleus"
+    - "Left_Accessory_Basal_nucleus"
+    - "Right_Accessory_Basal_nucleus"
+    - "Right_Cortical_nucleus"
+  seed_source: "DIRECT Phase II individualized MNI-space labels"
+  seed_selection: "DPABI FC wildcard matching"
+  label_id: 7008
+  seed_space: "MNI"
+  label_interpolation: "nearest_neighbour"
+  correlation: "Pearson"
+  transform: "Fisher_r_to_z"
+  inherited_preprocessing: "See manuscript Methods; the FC GUI consumed an already preprocessed derivative"
+  nuisance_covariates_regression_in_this_gui_run: false
+  ica_aroma_noise_removal_in_this_gui_run: false
+  temporal_filter_in_this_gui_run: false
+  timepoint_scrubbing_in_this_gui_run: false
+  head_motion_scrubbing_regressors_in_this_gui_run: false
+  global_signal_regression: true
+  global_signal_regression_evidence: "DPABI FunVoluGlobal input branch"
+  calculate_functional_connectivity: true
+  extract_roi_time_courses: true
+  normalize_derivatives: true
+  smooth_input_images: false
+  smooth_derivatives: true
+  surface_smoothing_fwhm_mm: 6
+  volume_smoothing_fwhm_mm: [6, 6, 6]
+
+fc_combat:
+  enabled: true
+  module: "DPABI Harmonization"
+  method: "ComBat"
+  parametric: true
+  batch: "site"
+  preserved_covariates: ["age", "sex", "mean_FD", "diagnosis"]
+  mask: "DPABI/Templates/BrainMask_05_97x115x97.nii"
+
+fc_group_glm:
+  module: "DPABI Statistical Analysis"
+  group_coding: "HC = 1; MDD = 2"
+  design_column_order: ["diagnosis_MDD_minus_HC", "age", "sex", "mean_FD"]
+  contrast_vector: [1, 0, 0, 0]
+  covariates: ["age", "sex", "mean_FD"]
+  analysis_mask: "DPABI/Templates/BrainMask_05_97x115x97.nii"
+
+grf:
+  voxel_p: 0.001
+  cluster_p: 0.05
+  two_tailed: true
+  connectivity: 26
+  correction_scope: "separately_per_seed"
+  smoothness_source: "nifti_header_dLh_or_FWHM"

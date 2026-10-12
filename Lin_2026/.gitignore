@@ -1,0 +1,52 @@
+# Study data and generated results (not for public release)
+data/
+derived/
+private_data/
+results/
+analysis/
+*.xlsx
+*.xls
+*.docx
+*.csv
+*.tsv
+*.mat
+*.npy
+*.npz
+*.pkl
+*.sav
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tif
+*.tiff
+*.log
+
+# Public schema/configuration examples are intentionally versioned
+!config/*.example.csv
+!config/fc_seed_manifest.csv
+
+# Python and MATLAB runtime artifacts
+__pycache__/
+*.py[cod]
+*.asv
+*.m~
+
+# Large image-derived outputs
+resliced_roi_masks/
+*.nii
+*.nii.gz
+
+# Local environment files
+.venv/
+venv/
+.env
+
+# Local document rendering and machine-generated provenance logs
+qa/
+provenance/*.csv
+tests/_synthetic_runtime/
+
+# Local review archives
+*.zip

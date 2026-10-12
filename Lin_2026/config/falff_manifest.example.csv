@@ -1,0 +1,2 @@
+SubjectID,FalffFile,Site,Age,Sex,Motion,Diagnosis
+sub-001,maps/sub-001_falff.nii,site-01,30,1,0.05,MDD
