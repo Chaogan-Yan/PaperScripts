@@ -1,0 +1,710 @@
+---
+title: "2026LLM_rating"
+output: html_document
+date: "2026-03-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(irr)
+library(patchwork)
+library(broom)
+library(stringr)
+```
+
+
+```{r}
+data_long <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/M_rater_all_data.xlsx") %>%
+  as.data.frame()
+
+```
+
+
+
+```{r}
+data_dim_long <- data_long %>%
+  pivot_longer(
+    cols = 5:ncol(.),
+    names_to = "Dimension",
+    values_to = "Score"
+  )
+
+data_dim_long$Group <- factor(data_dim_long$Group)
+data_dim_long$Rater <- factor(data_dim_long$Rater)
+data_dim_long$Dimension <- factor(data_dim_long$Dimension)
+```
+
+#1.human vs llm ICC
+```{r}
+pair_human_llm <- data_dim_long %>%
+  filter(Rater %in% c("human", "deepseek_V3.2", "Chat_GPT_5.4", "Claude_Sonnet_4.6")) %>%
+  pivot_wider(
+    id_cols = c(Participant_ID, Group, Dimension),
+    names_from = Rater,
+    values_from = Score
+  )
+```
+
+```{r}
+calc_agreement <- function(df, llm_name) {
+  df %>%
+    group_by(Dimension) %>%
+    summarise(
+      n = sum(!is.na(human) & !is.na(.data[[llm_name]])),
+      pearson_r = cor(human, .data[[llm_name]], use = "pairwise.complete.obs", method = "pearson"),
+      spearman_r = cor(human, .data[[llm_name]], use = "pairwise.complete.obs", method = "spearman"),
+      mean_diff = mean(.data[[llm_name]] - human, na.rm = TRUE),
+      mae = mean(abs(.data[[llm_name]] - human), na.rm = TRUE),
+      rmse = sqrt(mean((.data[[llm_name]] - human)^2, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(LLM = llm_name)
+}
+
+res_human_vs_llm <- bind_rows(
+  calc_agreement(pair_human_llm, "deepseek_V3.2"),
+  calc_agreement(pair_human_llm, "Chat_GPT_5.4"),
+  calc_agreement(pair_human_llm, "Claude_Sonnet_4.6")
+)
+
+res_human_vs_llm
+```
+
+```{r}
+icc_a1_fast <- function(x, y) {
+  ok <- complete.cases(x, y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  n <- length(x)
+  k <- 2
+  
+  if (n < 3) return(NA_real_)
+  
+  dat <- cbind(x, y)
+  
+  row_means <- rowMeans(dat)
+  col_means <- colMeans(dat)
+  grand_mean <- mean(dat)
+  
+  ss_rows <- k * sum((row_means - grand_mean)^2)
+  ss_cols <- n * sum((col_means - grand_mean)^2)
+  ss_total <- sum((dat - grand_mean)^2)
+  ss_error <- ss_total - ss_rows - ss_cols
+  
+  ms_rows <- ss_rows / (n - 1)
+  ms_cols <- ss_cols / (k - 1)
+  ms_error <- ss_error / ((n - 1) * (k - 1))
+  
+  icc <- (ms_rows - ms_error) / (ms_rows + (k - 1) * ms_error + k * (ms_cols - ms_error) / n)
+  as.numeric(icc)
+}
+```
+
+```{r}
+boot_icc <- function(x, y, B = 1000, conf = 0.95, seed = 123) {
+  ok <- complete.cases(x, y)
+  x <- x[ok]
+  y <- y[ok]
+  
+  n <- length(x)
+  if (n < 3) {
+    return(data.frame(
+      n = n,
+      ICC = NA_real_,
+      ICC_lwr = NA_real_,
+      ICC_upr = NA_real_
+    ))
+  }
+  
+  set.seed(seed)
+  
+  icc_obs <- icc_a1_fast(x, y)
+  
+  boot_vals <- replicate(B, {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    icc_a1_fast(x[idx], y[idx])
+  })
+  
+  alpha <- (1 - conf) / 2
+  
+  data.frame(
+    n = n,
+    ICC = icc_obs,
+    ICC_lwr = as.numeric(quantile(boot_vals, probs = alpha, na.rm = TRUE)),
+    ICC_upr = as.numeric(quantile(boot_vals, probs = 1 - alpha, na.rm = TRUE))
+  )
+}
+```
+
+```{r}
+calc_icc_boot <- function(df, llm_name, B = 1000, conf = 0.95, seed = 123) {
+  dims <- unique(df$Dimension)
+  
+  out <- lapply(seq_along(dims), function(i) {
+    d <- dims[i]
+    
+    tmp <- df %>%
+      filter(Dimension == d)
+    
+    res <- boot_icc(
+      x = tmp$human,
+      y = tmp[[llm_name]],
+      B = B,
+      conf = conf,
+      seed = seed + i
+    )
+    
+    data.frame(
+      Dimension = d,
+      LLM = llm_name,
+      n = res$n,
+      ICC = res$ICC,
+      ICC_lwr = res$ICC_lwr,
+      ICC_upr = res$ICC_upr
+    )
+  })
+  
+  bind_rows(out)
+}
+```
+
+```{r}
+icc_human_vs_llm_boot <- bind_rows(
+  calc_icc_boot(pair_human_llm, "Chat_GPT_5.4", B = 1000),
+  calc_icc_boot(pair_human_llm, "deepseek_V3.2", B = 1000),
+  calc_icc_boot(pair_human_llm, "Claude_Sonnet_4.6", B = 1000)
+)
+
+icc_human_vs_llm_boot
+```
+
+```{r}
+res_human_vs_llm_all <- res_human_vs_llm %>%
+  left_join(
+    icc_human_vs_llm_boot,
+    by = c("Dimension", "LLM")
+  )
+
+res_human_vs_llm_all
+```
+
+
+```{r}
+plot_icc_nature <- function(data, llm_name,
+                            xlim = c(-0.1, 0.8),
+                            highlight_cut = 0.50) {
+  
+  df_plot <- data %>%
+    filter(LLM == llm_name) %>%
+    mutate(
+      Dimension = str_wrap(as.character(Dimension), width = 8)
+    ) %>%
+    arrange(ICC) %>%
+    mutate(
+      Dimension = factor(Dimension, levels = Dimension),
+      Highlight = ifelse(ICC >= highlight_cut, "ICC ≥ 0.50", "ICC < 0.50")
+    )
+  
+  ggplot(df_plot, aes(x = ICC, y = Dimension)) +
+    geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.4, color = "grey70") +
+    geom_vline(xintercept = 0.5, linetype = "dashed", linewidth = 0.4, color = "grey55") +
+    geom_errorbarh(
+      aes(xmin = ICC_lwr, xmax = ICC_upr),
+      height = 0,
+      linewidth = 0.6,
+      color = "grey35"
+    ) +
+    geom_point(
+      aes(fill = Highlight),
+      shape = 21,
+      size = 2.8,
+      stroke = 0.4,
+      color = "black"
+    ) +
+    scale_fill_manual(
+      values = c("ICC ≥ 0.50" = "black", "ICC < 0.50" = "white")
+    ) +
+    scale_x_continuous(
+      limits = xlim,
+      breaks = seq(0, 0.8, by = 0.2),
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    labs(
+      title = paste0("Human vs ", llm_name),
+      x = "Intraclass correlation coefficient (ICC)",
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 13, face = "bold", hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.text.y = element_text(size = 10, color = "black"),
+      axis.text.x = element_text(size = 10, color = "black"),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      legend.title = element_blank(),
+      legend.position = "top",
+      plot.margin = margin(10, 15, 10, 10)
+    )
+}
+```
+
+```{r}
+#p_chatgpt <- plot_icc_nature(icc_human_vs_llm_boot, "Chat_GPT_4omini")
+#p_v3      <- plot_icc_nature(icc_human_vs_llm_boot, "deepseek_V3")
+p_v32     <- plot_icc_nature(icc_human_vs_llm_boot, "deepseek_V3.2")
+p_gpt54     <- plot_icc_nature(icc_human_vs_llm_boot, "Chat_GPT_5.4")
+p_claude     <- plot_icc_nature(icc_human_vs_llm_boot, "Claude_Sonnet_4.6")
+#p_gpt5     <- plot_icc_nature(icc_human_vs_llm_boot, "Chat_GPT_5mini")
+#p_gemini25     <- plot_icc_nature(icc_human_vs_llm_boot, "Gemini_2.5_Flash_Lite")
+
+combinedgpt <- p_v32 | p_gpt54 | p_claude
+combinedgpt
+```
+
+```{r}
+combineddp <- p_v3 | p_v32
+combineddp
+```
+
+
+
+#2.different llms ICC
+```{r}
+calc_pairwise_icc_boot <- function(df, rater1, rater2, B = 1000, conf = 0.95, seed = 123) {
+  dims <- unique(df$Dimension)
+  
+  out <- lapply(seq_along(dims), function(i) {
+    d <- dims[i]
+    
+    tmp <- df %>%
+      filter(Dimension == d)
+    
+    res <- boot_icc(
+      x = tmp[[rater1]],
+      y = tmp[[rater2]],
+      B = B,
+      conf = conf,
+      seed = seed + i
+    )
+    
+    data.frame(
+      Dimension = d,
+      Pair = paste(rater1, "vs", rater2),
+      n = res$n,
+      ICC = res$ICC,
+      ICC_lwr = res$ICC_lwr,
+      ICC_upr = res$ICC_upr
+    )
+  })
+  
+  bind_rows(out)
+}
+```
+
+```{r}
+pair_llm <- data_dim_long %>%
+  filter(Rater %in% c("Chat_GPT_5.4", "deepseek_V3.2", "Claude_Sonnet_4.6")) %>%
+  pivot_wider(
+    id_cols = c(Participant_ID, Group, Dimension),
+    names_from = Rater,
+    values_from = Score
+  )
+```
+
+```{r}
+icc_llm_pairs_boot <- bind_rows(
+  calc_pairwise_icc_boot(pair_llm, "Chat_GPT_5.4", "deepseek_V3.2", B = 1000, seed = 2000),
+  calc_pairwise_icc_boot(pair_llm, "Chat_GPT_5.4", "Claude_Sonnet_4.6", B = 1000, seed = 3000),
+  calc_pairwise_icc_boot(pair_llm, "Claude_Sonnet_4.6", "deepseek_V3.2", B = 1000, seed = 4000)
+)
+
+icc_llm_pairs_boot
+```
+
+```{r}
+plot_pairwise_icc <- function(data, pair_name,
+                              xlim = c(-0.1, 1.0),
+                              highlight_cut = 0.50) {
+  
+  df_plot <- data %>%
+    filter(Pair == pair_name) %>%
+    mutate(
+      Dimension = str_wrap(as.character(Dimension), width = 8)
+    ) %>%
+    arrange(ICC) %>%
+    mutate(
+      Dimension = factor(Dimension, levels = Dimension),
+      Highlight = ifelse(ICC >= highlight_cut, "ICC ≥ 0.50", "ICC < 0.50")
+    )
+  
+  ggplot(df_plot, aes(x = ICC, y = Dimension)) +
+    geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.4, color = "grey70") +
+    geom_vline(xintercept = 0.5, linetype = "dashed", linewidth = 0.4, color = "grey55") +
+    geom_errorbarh(
+      aes(xmin = ICC_lwr, xmax = ICC_upr),
+      height = 0,
+      linewidth = 0.6,
+      color = "grey35"
+    ) +
+    geom_point(
+      aes(fill = Highlight),
+      shape = 21,
+      size = 2.8,
+      stroke = 0.4,
+      color = "black"
+    ) +
+    scale_fill_manual(
+      values = c("ICC ≥ 0.50" = "black", "ICC < 0.50" = "white")
+    ) +
+    scale_x_continuous(
+      limits = xlim,
+      breaks = seq(0, 1.0, by = 0.2),
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    labs(
+      title = pair_name,
+      x = "Intraclass correlation coefficient (ICC)",
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 13, face = "bold", hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.text.y = element_text(size = 10, color = "black"),
+      axis.text.x = element_text(size = 10, color = "black"),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      legend.title = element_blank(),
+      legend.position = "top",
+      plot.margin = margin(10, 15, 10, 10)
+    )
+}
+```
+
+
+```{r}
+p_llm_1 <- plot_pairwise_icc(icc_llm_pairs_boot, "Chat_GPT_5.4 vs deepseek_V3.2")
+p_llm_2 <- plot_pairwise_icc(icc_llm_pairs_boot, "Chat_GPT_5.4 vs Claude_Sonnet_4.6")
+p_llm_3 <- plot_pairwise_icc(icc_llm_pairs_boot, "Claude_Sonnet_4.6 vs deepseek_V3.2")
+
+combined_llm_pairs <- p_llm_1 | p_llm_2 | p_llm_3
+#combined_llm_pairs <- p_llm_1 | p_llm_2
+combined_llm_pairs
+```
+
+#3.deepseek ICC
+```{r}
+pair_deepseek <- data_dim_long %>%
+  filter(Rater %in% c("deepseek_V3.2", "deepseek_V3")) %>%
+  pivot_wider(
+    id_cols = c(Participant_ID, Group, Dimension),
+    names_from = Rater,
+    values_from = Score
+  ) %>%
+  mutate(
+    Diff = `deepseek_V3.2` - deepseek_V3,
+    AbsDiff = abs(`deepseek_V3.2` - deepseek_V3)
+  )
+```
+
+```{r}
+res_deepseek_agree <- pair_deepseek %>%
+  group_by(Dimension) %>%
+  summarise(
+    pearson_r = cor(`deepseek_V3.2`, deepseek_V3, use = "pairwise.complete.obs"),
+    spearman_r = cor(`deepseek_V3.2`, deepseek_V3, use = "pairwise.complete.obs", method = "spearman"),
+    mean_diff = mean(Diff, na.rm = TRUE),
+    mae = mean(AbsDiff, na.rm = TRUE),
+    rmse = sqrt(mean(Diff^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+res_deepseek_agree
+```
+
+```{r}
+icc_deepseek_boot <- pair_deepseek %>%
+  group_by(Dimension) %>%
+  group_modify(~{
+    res <- boot_icc(
+      x = .x$`deepseek_V3.2`,
+      y = .x$deepseek_V3,
+      B = 1000,
+      conf = 0.95,
+      seed = 123
+    )
+    
+    data.frame(
+      n = res$n,
+      ICC = res$ICC,
+      ICC_lwr = res$ICC_lwr,
+      ICC_upr = res$ICC_upr
+    )
+  }) %>%
+  ungroup()
+
+icc_deepseek_boot
+```
+
+```{r}
+res_deepseek_all <- res_deepseek_agree %>%
+  left_join(icc_deepseek_boot, by = "Dimension")
+
+res_deepseek_all
+```
+
+```{r}
+plot_icc_deepseek <- function(data,
+                              xlim = c(-0.1, 1.0),
+                              highlight_cut = 0.50) {
+  
+  df_plot <- data %>%
+    mutate(
+      Dimension = str_wrap(as.character(Dimension), width = 8)
+    ) %>%
+    arrange(ICC) %>%
+    mutate(
+      Dimension = factor(Dimension, levels = Dimension),
+      Highlight = ifelse(ICC >= highlight_cut, "ICC ≥ 0.50", "ICC < 0.50")
+    )
+  
+  ggplot(df_plot, aes(x = ICC, y = Dimension)) +
+    geom_vline(xintercept = 0, linetype = "solid", linewidth = 0.4, color = "grey70") +
+    geom_vline(xintercept = 0.5, linetype = "dashed", linewidth = 0.4, color = "grey55") +
+    geom_errorbarh(
+      aes(xmin = ICC_lwr, xmax = ICC_upr),
+      height = 0,
+      linewidth = 0.6,
+      color = "grey35"
+    ) +
+    geom_point(
+      aes(fill = Highlight),
+      shape = 21,
+      size = 2.8,
+      stroke = 0.4,
+      color = "black"
+    ) +
+    scale_fill_manual(
+      values = c("ICC ≥ 0.50" = "black", "ICC < 0.50" = "white")
+    ) +
+    scale_x_continuous(
+      limits = xlim,
+      breaks = seq(0, 1.0, by = 0.2),
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    labs(
+      title = "deepseek_V3.2 vs deepseek_V3",
+      x = "Intraclass correlation coefficient (ICC)",
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 13, face = "bold", hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.text.y = element_text(size = 10, color = "black"),
+      axis.text.x = element_text(size = 10, color = "black"),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      legend.title = element_blank(),
+      legend.position = "top",
+      plot.margin = margin(10, 15, 10, 10)
+    )
+}
+
+p_deepseek <- plot_icc_deepseek(icc_deepseek_boot)
+p_deepseek
+```
+
+
+
+#4. HC vs MDD patterns
+```{r}
+calc_icc_boot_by_group <- function(df, llm_name, B = 1000, conf = 0.95, seed = 123) {
+  groups <- unique(df$Group)
+  dims <- unique(df$Dimension)
+  
+  out <- list()
+  idx_count <- 0
+  
+  for (g in groups) {
+    for (d in dims) {
+      idx_count <- idx_count + 1
+      
+      tmp <- df %>%
+        filter(Group == g, Dimension == d)
+      
+      res <- boot_icc(
+        x = tmp$human,
+        y = tmp[[llm_name]],
+        B = B,
+        conf = conf,
+        seed = seed + idx_count
+      )
+      
+      out[[idx_count]] <- data.frame(
+        Group = as.character(g),
+        Dimension = d,
+        LLM = llm_name,
+        n = res$n,
+        ICC = res$ICC,
+        ICC_lwr = res$ICC_lwr,
+        ICC_upr = res$ICC_upr
+      )
+    }
+  }
+  
+  bind_rows(out)
+}
+```
+
+```{r}
+icc_by_group_boot <- bind_rows(
+  calc_icc_boot_by_group(pair_human_llm, "Chat_GPT_4omini", B = 1000, seed = 100),
+  calc_icc_boot_by_group(pair_human_llm, "Chat_GPT_5mini", B = 1000, seed = 300),
+  calc_icc_boot_by_group(pair_human_llm, "deepseek_V3", B = 1000, seed = 200),
+  calc_icc_boot_by_group(pair_human_llm, "deepseek_V3.2", B = 1000, seed = 300),
+  calc_icc_boot_by_group(pair_human_llm, "Gemini_2.5_Flash_Lite", B = 1000, seed = 300)
+)
+
+icc_by_group_boot
+```
+
+```{r}
+n_check_by_group <- pair_human_llm %>%
+  group_by(Group, Dimension) %>%
+  summarise(
+    n_chatgpt = sum(complete.cases(human, Chat_GPT_4omini)),
+    n_chatgpt5 =sum(complete.cases(human, Chat_GPT_5mini)),
+    n_v3      = sum(complete.cases(human, deepseek_V3)),
+    n_v32     = sum(complete.cases(human, `deepseek_V3.2`)),
+    n_gemini     = sum(complete.cases(human, `Gemini_2.5_Flash_Lite`)),
+    .groups = "drop"
+  )
+
+n_check_by_group
+```
+
+```{r}
+plot_group_icc_boot <- function(data, llm_name,
+                                xlim = c(-0.1, 0.8),
+                                highlight_cut = 0.50) {
+  
+  df_plot <- data %>%
+    filter(LLM == llm_name) %>%
+    mutate(
+      Dimension = str_wrap(as.character(Dimension), width = 8)
+    ) %>%
+    group_by(Group) %>%
+    arrange(ICC, .by_group = TRUE) %>%
+    mutate(
+      Dimension = factor(Dimension, levels = unique(Dimension)),
+      Highlight = ifelse(ICC >= highlight_cut, "ICC ≥ 0.50", "ICC < 0.50")
+    ) %>%
+    ungroup()
+  
+  ggplot(df_plot, aes(x = ICC, y = Dimension)) +
+    geom_vline(xintercept = 0, color = "grey82", linewidth = 0.4) +
+    geom_vline(xintercept = 0.5, color = "grey55", linewidth = 0.45, linetype = "dashed") +
+    geom_errorbarh(
+      aes(xmin = ICC_lwr, xmax = ICC_upr),
+      height = 0,
+      linewidth = 0.7,
+      color = "grey35"
+    ) +
+    geom_point(
+      aes(fill = Highlight),
+      shape = 21,
+      size = 2.8,
+      stroke = 0.35,
+      color = "black"
+    ) +
+    scale_fill_manual(
+      values = c("ICC ≥ 0.50" = "black", "ICC < 0.50" = "white"),
+      guide = "none"
+    ) +
+    scale_x_continuous(
+      limits = xlim,
+      breaks = seq(0, 0.8, by = 0.2),
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    facet_wrap(~ Group, nrow = 1) +
+    labs(
+      title = llm_name,
+      subtitle = "Human–LLM agreement within HC and MDD (bootstrap ICC)",
+      x = "Intraclass correlation coefficient (ICC)",
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13, hjust = 0),
+      plot.subtitle = element_text(size = 10, color = "grey30", hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.text.x = element_text(size = 10, color = "black"),
+      axis.text.y = element_text(size = 10, color = "black"),
+      axis.line.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = 11)
+    )
+}
+```
+
+
+```{r}
+#p_chatgpt_group_boot <- plot_group_icc_boot(icc_by_group_boot, "Chat_GPT_4omini")
+#p_v3_group_boot      <- plot_group_icc_boot(icc_by_group_boot, "deepseek_V3")
+#p_v32_group_boot     <- plot_group_icc_boot(icc_by_group_boot, "deepseek_V3.2")
+
+p_gpt5_group_boot <- plot_group_icc_boot(icc_by_group_boot, "Chat_GPT_5mini")
+p_gemini_group_boot <- plot_group_icc_boot(icc_by_group_boot, "Gemini_2.5_Flash_Lite")
+#p_chatgpt_group_boot
+#p_v3_group_boot
+#p_v32_group_boot
+p_gemini_group_boot
+```
+
+```{r}
+p_gpt5_group_boot
+```
+
+
+#
+
+```{r}
+icc_group_diff <- icc_by_group %>%
+  select(Group, Dimension, LLM, ICC) %>%
+  pivot_wider(names_from = Group, values_from = ICC) %>%
+  mutate(
+    ICC_diff_MDD_minus_HC = MDD - HC
+  )
+```
+
+```{r}
+ggplot(icc_group_diff,
+       aes(x = ICC_diff_MDD_minus_HC, y = Dimension)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey50") +
+  geom_point(aes(color = ICC_diff_MDD_minus_HC > 0), size = 2) +
+  scale_color_manual(values = c("TRUE"="firebrick","FALSE"="steelblue")) +
+  facet_wrap(~ LLM, ncol = 3) +
+  theme_bw(base_size = 12) +
+  labs(
+    x = "ICC difference (MDD - HC)",
+    y = NULL,
+    title = "Group difference in Human–LLM agreement"
+  )
+```
+
+
+
+
+

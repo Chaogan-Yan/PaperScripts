@@ -1,0 +1,1690 @@
+---
+title: "new_analysis"
+output: html_document
+date: "2026-04-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(irr)
+library(patchwork)
+library(broom)
+library(stringr)
+library(writexl)
+library(patchwork)
+library(forcats)
+library(openxlsx)
+library(psych)
+library(ggbeeswarm)
+library(ggh4x)
+```
+
+
+```{r}
+Gender_alldata <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_gender.xlsx")
+
+Group_alldata <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_group.xlsx")
+
+Gender_ID <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/HC_Gender.xlsx")
+
+Group_ID <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/MDD_HC_ID.xlsx")
+```
+
+## 年龄差异检验：Gender_ID（female vs male）与 Group_ID（MDD vs HC）
+
+```{r}
+# Gender_ID：female vs male 方差齐性检验（F test）+ 年龄 t检验
+gender_id_age_vartest <- var.test(Age ~ Gender, data = Gender_ID)
+gender_id_age_vartest
+
+gender_id_age_ttest <- t.test(Age ~ Gender, data = Gender_ID)
+gender_id_age_ttest
+
+# Group_ID：Age列有非数值取值（如"/"），先转数值，再做方差齐性检验 + t检验
+Group_ID <- Group_ID %>%
+  mutate(Age = suppressWarnings(as.numeric(Age)))
+
+group_id_age_vartest <- var.test(Age ~ Group, data = Group_ID)
+group_id_age_vartest
+
+group_id_age_ttest <- t.test(Age ~ Group, data = Group_ID)
+group_id_age_ttest
+```
+
+## 重命名第6-31列（26个维度）
+
+```{r}
+ng_q_names <- c("rating of depression", "interoceptive", "internally focused", "externally focused",
+                 "self focused", "other focused", "positive", "negative", "problem solving", "guilt",
+                 "concern", "anger", "disgust", "fear", "sadness", "surprise", "happiness", "liking",
+                 "pleasure", "self-abasement", "disappointment", "reflection", "past", "future",
+                 "present", "rumination")
+
+colnames(Gender_alldata)[6:31] <- ng_q_names
+colnames(Group_alldata)[6:31] <- ng_q_names
+```
+
+## 定义目标维度（ICC>=0.5，剔除rating of depression / self-abasement / reflection）与目标Rater
+
+```{r}
+dims_23 <- c("interoceptive", "internally focused", "externally focused", "self focused", "other focused",
+             "positive", "negative", "problem solving", "guilt", "concern", "anger", "disgust", "fear",
+             "sadness", "surprise", "happiness", "liking", "pleasure", "disappointment", "past", "future",
+             "present", "rumination")
+
+target_raters <- c("DeepSeek-V4-Flash", "Gemini-2.5Flash-Lite", "GPT-5mini", "Human")
+```
+
+low-cost模型集合更新为4个：Qwen-3.5-27B / DeepSeek-V4-Flash / Gemini-2.5Flash-Lite / GPT-5mini（原来的 Deepseek-V3.2 不再属于这个集合，Qwen-3.5-27B 和 DeepSeek-V4-Flash 是新加入的）。原始数据里 Rater 列实际有13个取值（还包含 Deepseek-V3.2 / GPT-4omini / DeepSeek-V3 / Gemini-3.1-Pro-Preview / Gemini-3.5-Flash 等未使用的模型版本），先筛掉不需要的：
+
+```{r}
+Gender_alldata %>% distinct(Rater) %>% arrange(Rater)
+
+# 确认 Qwen-3.5-27B / DeepSeek-V4-Flash 这两个新Rater的字符串写法能精确匹配上（避免大小写/命名不一致导致筛选后静默丢行）
+setdiff(target_raters, unique(Gender_alldata$Rater))
+```
+
+```{r}
+Gender_alldata <- Gender_alldata %>% filter(Rater %in% target_raters)
+Group_alldata  <- Group_alldata  %>% filter(Rater %in% target_raters)
+```
+
+## 合并性别信息
+
+`Gender_alldata` 本身没有 Gender 列，需要用 Sub_ID 从 `Gender_ID`（即 HC_Gender.xlsx）里把 Gender 关联进来（两边 Sub_ID 可完全精确匹配，282个被试全部对上）：
+
+```{r}
+Gender_alldata <- Gender_alldata %>%
+  left_join(Gender_ID %>% select(Sub_ID, Gender), by = "Sub_ID")
+
+# 检查有没有没匹配上性别的被试（应为0行）
+Gender_alldata %>% filter(is.na(Gender)) %>% distinct(Sub_ID)
+```
+
+## 片段水平合成复合评分：Human（已是3人均分） vs LLM_mean（4个low-cost模型在每个思维片段上的均分）
+
+`Rater=="Human"` 这一行在源数据里已经是3位人类评分者在该思维片段上的均分，可以直接使用；LLM这边要对齐同样的逻辑：在**每个 Participant_ID（思维片段）**上，把4个选定模型（Qwen-3.5-27B / DeepSeek-V4-Flash / Gemini-2.5Flash-Lite / GPT-5mini）的评分取均值，得到一个和 Human 同层级的 "LLM_mean" 片段评分，这样两条线在往上聚合到被试之前，处理路径是完全对称的：
+
+```{r}
+llm_raters <- setdiff(target_raters, "Human")
+
+human_segment <- Gender_alldata %>%
+  filter(Rater == "Human") %>%
+  select(Participant_ID, Sub_ID, Gender, all_of(dims_23)) %>%
+  mutate(Rater = "Human")
+
+llm_segment <- Gender_alldata %>%
+  filter(Rater %in% llm_raters) %>%
+  group_by(Participant_ID, Sub_ID, Gender) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(Rater = "LLM_mean")
+
+Gender_segment_composite <- bind_rows(human_segment, llm_segment)
+
+# 应为 (思维片段总数) x 2（Human / LLM_mean）
+dim(Gender_segment_composite)
+table(Gender_segment_composite$Rater)
+```
+
+## 被试水平聚合：在片段层面合成好的复合评分基础上，对每人的所有思维片段取均值
+
+## 每个被试的思维片段数不同，直接拿片段当分析单位会违反独立性假设，所以分析单位要落到被试层面。这一步在 `Gender_segment_composite` 之上、按 `Sub_ID x Rater` 分组对所有片段取均值，Human 和 LLM_mean 走的是同一套聚合逻辑：
+
+```{r}
+Gender_composite <- Gender_segment_composite %>%
+  group_by(Sub_ID, Gender, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# 应为 282个被试 x 2（Human / LLM_mean） = 564 行
+dim(Gender_composite)
+table(Gender_composite$Rater, Gender_composite$Gender)
+```
+
+## 正态性检验：按 Rater（Human / LLM_mean）x Gender 分组，对23个维度分别检验
+
+组间比较（男 vs 女）关心的是每组内的正态性，而不是不分组的整体正态性，所以要按 Gender 分组后对23个维度分别做 Shapiro-Wilk 检验，Human 和 LLM_mean 分开做。同时报偏度（skewness）和峰度（kurtosis）作为补充描述。
+
+已经确定：不管这里检验结果如何，后续男女组间比较统一用 Mann-Whitney U（非参数），所以这里的 Shapiro-Wilk 结果只写进方法/结果部分做支持性说明，不用来逐维度切换检验方法。
+
+```{r}
+normality_check <- function(data, dims, group_var = "Gender") {
+  map_dfr(dims, function(v) {
+    data %>%
+      group_by(.data[[group_var]]) %>%
+      summarise(
+        variable = v,
+        n = sum(!is.na(.data[[v]])),
+        skewness = psych::skew(.data[[v]], na.rm = TRUE),
+        kurtosis = psych::kurtosi(.data[[v]], na.rm = TRUE),
+        shapiro_W = shapiro.test(.data[[v]])$statistic,
+        shapiro_p = shapiro.test(.data[[v]])$p.value,
+        .groups = "drop"
+      )
+  })
+}
+
+normality_results <- Gender_composite %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23)) %>%
+  ungroup()
+
+normality_results %>% arrange(Rater, shapiro_p)
+
+# 快速看一下每条线（Human / LLM_mean）里有多少"维度x组"组合不满足正态（p<.05）
+normality_results %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+```
+
+把正态性检验结果存成 xlsx：
+
+```{r}
+write_xlsx(normality_results,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_normality_mini.xlsx")
+```
+
+## Mann-Whitney U 检验：Male vs Female，23个维度 x Human/LLM_mean，FDR校正
+
+对 `Gender_composite` 里的每个 Rater（Human / LLM_mean），23个维度分别做 Mann-Whitney U 检验，再在每个 Rater 内部对23个p值做 Benjamini-Hochberg FDR 校正。R的`wilcox.test()`返回的统计量叫"W"，对两独立样本检验来说数值上就是Mann-Whitney U，这里直接命名成U；Z是从p值反推的（R没有直接给），r = Z/√N（Rosenthal公式，常见论文报告Mann-Whitney U效应量用的就是这个）：
+
+```{r}
+mwu_results <- Gender_composite %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Gender)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Gender == grp_levels[1]]
+      y <- .x[[v]][.x$Gender == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      # 直接按秩和检验的正态近似公式算Z（带连续性校正+并列秩校正，跟R内部算p值用的是同一套公式），
+      # 不再从p值反推——效应极端时p会下溢成精确的0，qnorm(1-0/2)=Inf，导致Z和r变成Inf
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+mwu_results %>% arrange(Rater, q)
+```
+
+补上每组的描述统计（Mean/SD/Median/IQR），按 Rater x variable 拼回 `mwu_results`：
+
+```{r}
+gender_desc <- Gender_composite %>%
+  group_by(Rater, Gender) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Gender), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Gender, stat), values_from = value, names_glue = "{Gender}_{stat}")
+
+mwu_results <- mwu_results %>%
+  left_join(gender_desc, by = c("Rater", "variable")) %>%
+  relocate(starts_with("female_"), starts_with("male_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+mwu_results %>% arrange(Rater, q)
+
+write_xlsx(mwu_results,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_mwu_mini.xlsx")
+```
+
+## 雷达图：Male vs Female 各维度均分（不标注显著性，用 plotthis::RadarPlot 画，标尺固定0-3-6-9）
+
+先算出每个 Rater x Gender 在23个维度上的均分（长表，正好是 `RadarPlot` 需要的输入形状：一行一个 x-group-facet 组合）：
+
+```{r}
+group_means <- Gender_composite %>%
+  group_by(Rater, Gender) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(cols = all_of(dims_23), names_to = "variable", values_to = "mean_score")
+```
+
+改用 `plotthis` 包的 `RadarPlot()`（不在CRAN上，需要 `remotes::install_github("pwwang/plotthis")`）。这里 `y` 直接给已经算好的 `mean_score`（不是像你参考代码里 `y = NULL` 那样让函数自己去数频数），`group_by = "Gender"` 控制两条线。Human / LLM_mean 不再用 `facet_by` 拼进同一张图，改用 `split_by = "Rater"` + `combine = FALSE`，这样返回的是一个按Rater命名的列表（`list(Human = ..., LLM_mean = ...)`），两张图各自独立、分开显示；`title = function(x) x` 让每张图自动用对应的Rater名字（Human / LLM_mean）当标题，并在 `theme_args` 里加粗：
+
+```{r, fig.width=7, fig.height=6.5}
+library(plotthis)
+
+dims_set1 <- c("interoceptive", "internally focused", "externally focused", "self focused",
+               "other focused", "positive", "negative", "problem solving", "past", "future", "present")
+
+dims_set2 <- c("guilt", "concern", "anger", "disgust", "fear", "sadness", "surprise",
+               "happiness", "liking", "pleasure", "disappointment", "rumination")
+
+radar_data_set1 <- group_means %>%
+  filter(variable %in% dims_set1) %>%
+  mutate(variable = factor(str_to_sentence(variable), levels = str_to_sentence(dims_set1)))
+
+radar_data_set2 <- group_means %>%
+  filter(variable %in% dims_set2) %>%
+  mutate(variable = factor(str_to_sentence(variable), levels = str_to_sentence(dims_set2)))
+
+# 图例key保留"线+点"组合样式，去掉边框/背景/标题，图例放到底部、字体加粗；
+# plot.margin 加大，给雷达图外圈的维度标签多留一点空间（RadarPlot没有单独的"标签偏移量"参数，
+# 只能靠加大画布边距来实现，如果效果还不够明显，可能需要另外查 RadarPlotAtomic 有没有更细的控制项）
+style_radar_legend <- function(p) {
+  p +
+    guides(colour = guide_legend(override.aes = list(linetype = 1, linewidth = 1.2))) +
+    theme(
+      legend.position = "bottom",
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      legend.title = element_blank(),
+      legend.text = element_text(face = "bold"),
+      plot.margin = margin(20, 20, 20, 20)
+    )
+}
+
+Radar_list_set1 <- RadarPlot(
+  radar_data_set1,
+  x = "variable",
+  group_by = "Gender",
+  y = "mean_score",
+  scale_y = "none",
+  y_min = 0,
+  y_max = 9,
+  y_nbreaks = 4,        # 0 / 3 / 6 / 9 四条刻度线
+  split_by = "Rater",
+  combine = FALSE,
+  fill = FALSE,
+  alpha = 0.4,
+  linewidth = 1,
+  pt_size = 2,
+  max_charwidth = 20,
+  theme_args = list(
+    axis.text.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ),
+  palcolor = c(female = "#9083AA", male = "#30ad41a9"),
+  aspect.ratio = 1,
+  legend.position = "bottom",
+  title = function(x) x
+)
+
+Radar_list_set2 <- RadarPlot(
+  radar_data_set2,
+  x = "variable",
+  group_by = "Gender",
+  y = "mean_score",
+  scale_y = "none",
+  y_min = 0,
+  y_max = 4,
+  y_nbreaks = 5,        # 0 / 1 / 2 / 3 / 4 五条刻度线
+  split_by = "Rater",
+  combine = FALSE,
+  fill = FALSE,
+  alpha = 0.4,
+  linewidth = 1,
+  pt_size = 2,
+  max_charwidth = 20,
+  theme_args = list(
+    axis.text.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  ),
+  palcolor = c(female = "#9083AA", male = "#30ad41a9"),
+  aspect.ratio = 1,
+  legend.position = "bottom",
+  title = function(x) x
+)
+
+Radar_list_set1 <- lapply(Radar_list_set1, style_radar_legend)
+Radar_list_set2 <- lapply(Radar_list_set2, style_radar_legend)
+
+Radar_list_set1$Human
+Radar_list_set1$LLM_mean
+Radar_list_set2$Human
+Radar_list_set2$LLM_mean
+```
+
+
+# Group组别（HC vs MDD）分析
+
+跟 Gender 那条线用同一套逻辑，但数据源换成 `Group_alldata`（sub_group_alldata.xlsx，178人，91HC+87MDD，Group列自带、不用再merge）和 `Group_ID`（MDD_HC_ID.xlsx，年龄/性别信息用）。`Group_alldata` 在最前面已经跟着 `Gender_alldata` 一起做过列名重命名和Rater筛选了，这里直接复用。
+
+## 片段水平合成复合评分：Human（3人均分） vs LLM_mean（6模型均分）
+
+```{r}
+human_segment_grp <- Group_alldata %>%
+  filter(Rater == "Human") %>%
+  select(Participant_ID, Sub_ID, Group, all_of(dims_23)) %>%
+  mutate(Rater = "Human")
+
+llm_segment_grp <- Group_alldata %>%
+  filter(Rater %in% llm_raters) %>%
+  group_by(Participant_ID, Sub_ID, Group) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(Rater = "LLM_mean")
+
+Group_segment_composite <- bind_rows(human_segment_grp, llm_segment_grp)
+
+dim(Group_segment_composite)
+table(Group_segment_composite$Rater)
+```
+
+## 被试水平聚合
+
+```{r}
+Group_composite <- Group_segment_composite %>%
+  group_by(Sub_ID, Group, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+# 应为 178个被试 x 2（Human / LLM_mean） = 356 行
+dim(Group_composite)
+table(Group_composite$Rater, Group_composite$Group)
+```
+
+## 正态性检验：按 Rater x Group 分组，23个维度分别检验
+
+复用前面 Gender 分析里定义好的 `normality_check()` 函数，group_var 换成 "Group"：
+
+```{r}
+group_normality_results <- Group_composite %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23, group_var = "Group")) %>%
+  ungroup()
+
+group_normality_results %>% arrange(Rater, shapiro_p)
+
+group_normality_results %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(group_normality_results,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_normality_mini.xlsx")
+```
+
+## Mann-Whitney U 检验：HC vs MDD，23个维度 x Human/LLM_mean，FDR校正
+
+跟 Gender 那边一样，统一用非参数检验，不因为正态性检验结果逐维度切换方法；同样加上 U（=W）、Z、r = Z/√N。Z直接按秩和检验的正态近似公式算（不从p值反推），避免效应极端、p下溢成0时Z变成Inf：
+
+```{r}
+group_mwu_results <- Group_composite %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Group)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Group == grp_levels[1]]
+      y <- .x[[v]][.x$Group == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+group_mwu_results %>% arrange(Rater, q)
+```
+
+补上每组的描述统计（Mean/SD/Median/IQR），按 Rater x variable 拼回 `group_mwu_results`：
+
+```{r}
+group_desc <- Group_composite %>%
+  group_by(Rater, Group) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Group), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Group, stat), values_from = value, names_glue = "{Group}_{stat}")
+
+group_mwu_results <- group_mwu_results %>%
+  left_join(group_desc, by = c("Rater", "variable")) %>%
+  relocate(starts_with("HC_"), starts_with("MDD_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+group_mwu_results %>% arrange(Rater, q)
+
+write_xlsx(group_mwu_results,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_mwu_mini.xlsx")
+```
+
+# 人口学描述性统计 + 年龄差异检验（Gender组 与 Group组）
+
+## Gender组（HC内部 Female vs Male）：来自 `Gender_ID`，年龄数据本身很干净（282人，无缺失）
+
+```{r}
+# N_text：每组下思维片段（text）的个数，text的id是 Participant_ID，按它去重计数
+n_text_gender <- Gender_alldata %>%
+  distinct(Participant_ID, Gender) %>%
+  count(Gender, name = "N_text")
+
+gender_age_desc <- Gender_ID %>%
+  group_by(Gender) %>%
+  summarise(N_sub = n(),
+            age_mean = mean(Age, na.rm = TRUE),
+            age_sd = sd(Age, na.rm = TRUE),
+            age_min = min(Age, na.rm = TRUE),
+            age_max = max(Age, na.rm = TRUE),
+            .groups = "drop") %>%
+  left_join(n_text_gender, by = "Gender") %>%
+  relocate(N_text, .after = N_sub) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+gender_age_desc
+
+shapiro.test(Gender_ID$Age[Gender_ID$Gender == "female"])
+shapiro.test(Gender_ID$Age[Gender_ID$Gender == "male"])
+
+# 年龄是单个连续变量、样本量较大（151/131），依CLT用t检验（Welch，不假设方差齐性，t.test()默认就是这个）
+gender_age_ttest <- t.test(Age ~ Gender, data = Gender_ID)
+gender_age_ttest
+```
+
+## Group组（HC vs MDD）：来自 `Group_ID`，注意有1人年龄是"/"（缺失），先清洗
+
+```{r}
+Group_ID <- Group_ID %>%
+  mutate(Age = suppressWarnings(as.numeric(Age)))
+
+# 缺失年龄的被试
+Group_ID %>% filter(is.na(Age))
+
+# N_text：Group_alldata（HC+MDD都在里面）按 Participant_ID 去重计数
+n_text_group <- Group_alldata %>%
+  distinct(Participant_ID, Group) %>%
+  count(Group, name = "N_text")
+
+# N_sub 用全组人数（91/87），年龄相关统计单独只从有效年龄的子集里算（MDD实际是86人参与）
+group_n_sub <- Group_ID %>%
+  group_by(Group) %>%
+  summarise(N_sub = n(), .groups = "drop")
+
+group_age_stats <- Group_ID %>%
+  filter(!is.na(Age)) %>%
+  group_by(Group) %>%
+  summarise(age_mean = mean(Age),
+            age_sd = sd(Age),
+            age_min = min(Age),
+            age_max = max(Age),
+            .groups = "drop")
+
+group_age_desc <- group_n_sub %>%
+  left_join(group_age_stats, by = "Group") %>%
+  left_join(n_text_group, by = "Group") %>%
+  relocate(N_text, .after = N_sub) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+group_age_desc
+
+shapiro.test(Group_ID$Age[Group_ID$Group == "HC"])
+shapiro.test(Group_ID$Age[Group_ID$Group == "MDD"])
+
+# 同样换成t检验（Welch）
+group_age_ttest <- t.test(Age ~ Group, data = Group_ID)
+group_age_ttest
+```
+
+## 附加：HC/MDD 两组的性别比例是否均衡（人口学表格常规项，非必须，供参考）
+
+```{r}
+sex_by_group <- table(Group_ID$Sex, Group_ID$Group)
+sex_by_group
+
+chisq.test(sex_by_group)
+```
+
+## 汇总导出
+
+```{r}
+demographics_list <- list(
+  Gender_group_age_desc = gender_age_desc,
+  HC_MDD_age_desc = group_age_desc,
+  HC_MDD_sex_table = as.data.frame.matrix(sex_by_group)
+)
+
+write.xlsx(demographics_list,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/demographics_summary.xlsx")
+```
+
+
+# 补充分析：Gemini-2.5Flash-Lite vs Human（替代Low-cost LLM mean，重复差异性检验与雷达图）
+
+这一整节完全独立，不依赖前面任何chunk是否已经跑过：重新读取原始excel、重新做列名重命名/rater筛选/Gender的Sub_ID匹配、重新定义 `dims_23`/`dims_set1`/`dims_set2`/`normality_check()`/`style_radar_legend()`，全部用带 `_gemini` 后缀的独立变量名，不会覆盖或依赖前面 Gender/Group 分析里的同名对象。分析逻辑上：把 `LLM_mean`（4个low-cost模型均分）换成单一模型 **Gemini-2.5Flash-Lite** 的评分，跟 Human 走同样的「片段水平合成 → 被试水平聚合 → 正态性检验 → Mann-Whitney U（FDR校正）→ 雷达图」流程，Gender（Male vs Female）和 Group（HC vs MDD）两条线都重复一遍。人口学部分不重复。为方便代码引用，把 Rater 标签从完整模型名简化为 `"Gemini"`。
+
+## 独立读取数据 + 重命名列名 + 筛选Rater
+
+```{r}
+Gender_alldata_gemini <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_gender.xlsx")
+Group_alldata_gemini  <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_group.xlsx")
+Gender_ID_gemini <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/HC_Gender.xlsx")
+
+ng_q_names <- c("rating of depression", "interoceptive", "internally focused", "externally focused",
+                 "self focused", "other focused", "positive", "negative", "problem solving", "guilt",
+                 "concern", "anger", "disgust", "fear", "sadness", "surprise", "happiness", "liking",
+                 "pleasure", "self-abasement", "disappointment", "reflection", "past", "future",
+                 "present", "rumination")
+
+colnames(Gender_alldata_gemini)[6:31] <- ng_q_names
+colnames(Group_alldata_gemini)[6:31]  <- ng_q_names
+
+dims_23 <- c("interoceptive", "internally focused", "externally focused", "self focused", "other focused",
+             "positive", "negative", "problem solving", "guilt", "concern", "anger", "disgust", "fear",
+             "sadness", "surprise", "happiness", "liking", "pleasure", "disappointment", "past", "future",
+             "present", "rumination")
+
+dims_set1 <- c("interoceptive", "internally focused", "externally focused", "self focused",
+               "other focused", "positive", "negative", "problem solving", "past", "future", "present")
+
+dims_set2 <- c("guilt", "concern", "anger", "disgust", "fear", "sadness", "surprise",
+               "happiness", "liking", "pleasure", "disappointment", "rumination")
+
+gemini_rater <- "Gemini-2.5Flash-Lite"
+keep_raters_gemini <- c(gemini_rater, "Human")
+
+Gender_alldata_gemini <- Gender_alldata_gemini %>% filter(Rater %in% keep_raters_gemini)
+Group_alldata_gemini  <- Group_alldata_gemini  %>% filter(Rater %in% keep_raters_gemini)
+```
+
+## 合并性别信息（Gender_alldata_gemini 本身没有 Gender 列，用 Sub_ID 从 Gender_ID_gemini 关联进来）
+
+```{r}
+Gender_alldata_gemini <- Gender_alldata_gemini %>%
+  left_join(Gender_ID_gemini %>% select(Sub_ID, Gender), by = "Sub_ID")
+
+# 检查有没有没匹配上性别的被试（应为0行）
+Gender_alldata_gemini %>% filter(is.na(Gender)) %>% distinct(Sub_ID)
+```
+
+Group_alldata_gemini 里 Group 列是原始数据自带的，不用额外merge。
+
+## 重新定义正态性检验函数与雷达图美化函数
+
+```{r}
+normality_check <- function(data, dims, group_var = "Gender") {
+  map_dfr(dims, function(v) {
+    data %>%
+      group_by(.data[[group_var]]) %>%
+      summarise(
+        variable = v,
+        n = sum(!is.na(.data[[v]])),
+        skewness = psych::skew(.data[[v]], na.rm = TRUE),
+        kurtosis = psych::kurtosi(.data[[v]], na.rm = TRUE),
+        shapiro_W = shapiro.test(.data[[v]])$statistic,
+        shapiro_p = shapiro.test(.data[[v]])$p.value,
+        .groups = "drop"
+      )
+  })
+}
+
+style_radar_legend <- function(p) {
+  p +
+    guides(colour = guide_legend(override.aes = list(linetype = 1, linewidth = 1.2))) +
+    theme(
+      legend.position = "bottom",
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      legend.title = element_blank(),
+      legend.text = element_text(face = "bold"),
+      plot.margin = margin(20, 20, 20, 20)
+    )
+}
+```
+
+## Gender：片段水平合成 Human vs Gemini
+
+`Rater=="Human"` 这一行本身已是3位人类评分者的均分，`Rater==gemini_rater` 是Gemini单模型评分，两者在片段层面已经是同一层级，不需要再额外聚合，直接把 Rater 标签统一改成 `"Human"` / `"Gemini"`：
+
+```{r}
+Gender_segment_composite_gemini <- Gender_alldata_gemini %>%
+  select(Participant_ID, Sub_ID, Gender, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == gemini_rater, "Gemini", Rater))
+
+dim(Gender_segment_composite_gemini)
+table(Gender_segment_composite_gemini$Rater)
+```
+
+## Gender：被试水平聚合
+
+```{r}
+Gender_composite_gemini <- Gender_segment_composite_gemini %>%
+  group_by(Sub_ID, Gender, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Gender_composite_gemini)
+table(Gender_composite_gemini$Rater, Gender_composite_gemini$Gender)
+```
+
+## Gender：正态性检验（复用 `normality_check()`）
+
+```{r}
+normality_results_gemini <- Gender_composite_gemini %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23)) %>%
+  ungroup()
+
+normality_results_gemini %>% arrange(Rater, shapiro_p)
+
+normality_results_gemini %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(normality_results_gemini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_gemini2.5_normality.xlsx")
+```
+
+## Gender：Mann-Whitney U 检验，FDR校正
+
+```{r}
+mwu_results_gemini <- Gender_composite_gemini %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Gender)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Gender == grp_levels[1]]
+      y <- .x[[v]][.x$Gender == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+mwu_results_gemini %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+gender_desc_gemini <- Gender_composite_gemini %>%
+  group_by(Rater, Gender) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Gender), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Gender, stat), values_from = value, names_glue = "{Gender}_{stat}")
+
+mwu_results_gemini <- mwu_results_gemini %>%
+  left_join(gender_desc_gemini, by = c("Rater", "variable")) %>%
+  relocate(starts_with("female_"), starts_with("male_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+mwu_results_gemini %>% arrange(Rater, q)
+
+write_xlsx(mwu_results_gemini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_gemini2.5_mwu.xlsx")
+```
+
+
+## Group（HC vs MDD）：片段水平合成 + 被试水平聚合
+
+跟 Gender 那边一样，Human 已是3人均分、Gemini 是单模型评分，同一层级，直接改标签即可：
+
+```{r}
+Group_segment_composite_gemini <- Group_alldata_gemini %>%
+  select(Participant_ID, Sub_ID, Group, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == gemini_rater, "Gemini", Rater))
+
+dim(Group_segment_composite_gemini)
+table(Group_segment_composite_gemini$Rater)
+
+Group_composite_gemini <- Group_segment_composite_gemini %>%
+  group_by(Sub_ID, Group, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Group_composite_gemini)
+table(Group_composite_gemini$Rater, Group_composite_gemini$Group)
+```
+
+## Group：正态性检验
+
+```{r}
+group_normality_results_gemini <- Group_composite_gemini %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23, group_var = "Group")) %>%
+  ungroup()
+
+group_normality_results_gemini %>% arrange(Rater, shapiro_p)
+
+group_normality_results_gemini %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(group_normality_results_gemini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_gemini2.5_normality.xlsx")
+```
+
+## Group：Mann-Whitney U 检验，FDR校正
+
+```{r}
+group_mwu_results_gemini <- Group_composite_gemini %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Group)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Group == grp_levels[1]]
+      y <- .x[[v]][.x$Group == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+group_mwu_results_gemini %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+group_desc_gemini <- Group_composite_gemini %>%
+  group_by(Rater, Group) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Group), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Group, stat), values_from = value, names_glue = "{Group}_{stat}")
+
+group_mwu_results_gemini <- group_mwu_results_gemini %>%
+  left_join(group_desc_gemini, by = c("Rater", "variable")) %>%
+  relocate(starts_with("HC_"), starts_with("MDD_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+group_mwu_results_gemini %>% arrange(Rater, q)
+
+write_xlsx(group_mwu_results_gemini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_gemini2.5_mwu.xlsx")
+```
+
+
+# 补充分析：GPT-5mini vs Human（替代Low-cost LLM mean，重复差异性检验与雷达图）
+
+跟上面 Gemini-2.5Flash-Lite 那一节完全同一套逻辑、同一套独立性（不依赖前面任何chunk），只是把目标模型换成 **GPT-5mini**，所有对象都用 `_gpt5mini` 后缀，不会跟 Gemini 那节或前面 Gender/Group 分析的对象冲突。
+
+## 独立读取数据 + 重命名列名 + 筛选Rater
+
+```{r}
+Gender_alldata_gpt5mini <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_gender.xlsx")
+Group_alldata_gpt5mini  <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_group.xlsx")
+Gender_ID_gpt5mini <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/HC_Gender.xlsx")
+
+colnames(Gender_alldata_gpt5mini)[6:31] <- ng_q_names
+colnames(Group_alldata_gpt5mini)[6:31]  <- ng_q_names
+
+gpt5mini_rater <- "GPT-5mini"
+keep_raters_gpt5mini <- c(gpt5mini_rater, "Human")
+
+Gender_alldata_gpt5mini <- Gender_alldata_gpt5mini %>% filter(Rater %in% keep_raters_gpt5mini)
+Group_alldata_gpt5mini  <- Group_alldata_gpt5mini  %>% filter(Rater %in% keep_raters_gpt5mini)
+```
+
+## 合并性别信息（Gender_alldata_gpt5mini 本身没有 Gender 列，用 Sub_ID 从 Gender_ID_gpt5mini 关联进来）
+
+```{r}
+Gender_alldata_gpt5mini <- Gender_alldata_gpt5mini %>%
+  left_join(Gender_ID_gpt5mini %>% select(Sub_ID, Gender), by = "Sub_ID")
+
+# 检查有没有没匹配上性别的被试（应为0行）
+Gender_alldata_gpt5mini %>% filter(is.na(Gender)) %>% distinct(Sub_ID)
+```
+
+Group_alldata_gpt5mini 里 Group 列是原始数据自带的，不用额外merge。`dims_23`/`dims_set1`/`dims_set2`/`normality_check()`/`style_radar_legend()` 在前面 Gemini 那节已经定义过，这里直接复用（内容跟重新定义一次完全一样，不需要再写一遍）。
+
+## Gender：片段水平合成 Human vs GPT5mini
+
+```{r}
+Gender_segment_composite_gpt5mini <- Gender_alldata_gpt5mini %>%
+  select(Participant_ID, Sub_ID, Gender, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == gpt5mini_rater, "GPT5mini", Rater))
+
+dim(Gender_segment_composite_gpt5mini)
+table(Gender_segment_composite_gpt5mini$Rater)
+```
+
+## Gender：被试水平聚合
+
+```{r}
+Gender_composite_gpt5mini <- Gender_segment_composite_gpt5mini %>%
+  group_by(Sub_ID, Gender, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Gender_composite_gpt5mini)
+table(Gender_composite_gpt5mini$Rater, Gender_composite_gpt5mini$Gender)
+```
+
+## Gender：正态性检验（复用 `normality_check()`）
+
+```{r}
+normality_results_gpt5mini <- Gender_composite_gpt5mini %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23)) %>%
+  ungroup()
+
+normality_results_gpt5mini %>% arrange(Rater, shapiro_p)
+
+normality_results_gpt5mini %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(normality_results_gpt5mini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_gpt5mini_normality.xlsx")
+```
+
+## Gender：Mann-Whitney U 检验，FDR校正
+
+```{r}
+mwu_results_gpt5mini <- Gender_composite_gpt5mini %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Gender)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Gender == grp_levels[1]]
+      y <- .x[[v]][.x$Gender == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+mwu_results_gpt5mini %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+gender_desc_gpt5mini <- Gender_composite_gpt5mini %>%
+  group_by(Rater, Gender) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Gender), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Gender, stat), values_from = value, names_glue = "{Gender}_{stat}")
+
+mwu_results_gpt5mini <- mwu_results_gpt5mini %>%
+  left_join(gender_desc_gpt5mini, by = c("Rater", "variable")) %>%
+  relocate(starts_with("female_"), starts_with("male_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+mwu_results_gpt5mini %>% arrange(Rater, q)
+
+write_xlsx(mwu_results_gpt5mini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_gpt5mini_mwu.xlsx")
+```
+
+## Group（HC vs MDD）：片段水平合成 + 被试水平聚合
+
+```{r}
+Group_segment_composite_gpt5mini <- Group_alldata_gpt5mini %>%
+  select(Participant_ID, Sub_ID, Group, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == gpt5mini_rater, "GPT5mini", Rater))
+
+dim(Group_segment_composite_gpt5mini)
+table(Group_segment_composite_gpt5mini$Rater)
+
+Group_composite_gpt5mini <- Group_segment_composite_gpt5mini %>%
+  group_by(Sub_ID, Group, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Group_composite_gpt5mini)
+table(Group_composite_gpt5mini$Rater, Group_composite_gpt5mini$Group)
+```
+
+## Group：正态性检验
+
+```{r}
+group_normality_results_gpt5mini <- Group_composite_gpt5mini %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23, group_var = "Group")) %>%
+  ungroup()
+
+group_normality_results_gpt5mini %>% arrange(Rater, shapiro_p)
+
+group_normality_results_gpt5mini %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(group_normality_results_gpt5mini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_gpt5mini_normality.xlsx")
+```
+
+## Group：Mann-Whitney U 检验，FDR校正
+
+```{r}
+group_mwu_results_gpt5mini <- Group_composite_gpt5mini %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Group)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Group == grp_levels[1]]
+      y <- .x[[v]][.x$Group == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+group_mwu_results_gpt5mini %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+group_desc_gpt5mini <- Group_composite_gpt5mini %>%
+  group_by(Rater, Group) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Group), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Group, stat), values_from = value, names_glue = "{Group}_{stat}")
+
+group_mwu_results_gpt5mini <- group_mwu_results_gpt5mini %>%
+  left_join(group_desc_gpt5mini, by = c("Rater", "variable")) %>%
+  relocate(starts_with("HC_"), starts_with("MDD_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+group_mwu_results_gpt5mini %>% arrange(Rater, q)
+
+write_xlsx(group_mwu_results_gpt5mini,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_gpt5mini_mwu.xlsx")
+```
+
+
+# 补充分析：DeepSeek-V4-Flash vs Human（新low-cost集合成员之一，重复差异性检验与雷达图）
+
+跟上面几节完全同一套逻辑、同一套独立性，目标模型换成 **DeepSeek-V4-Flash**，所有对象都用 `_deepseekv4` 后缀，Rater简化标签用 `"DeepSeekV4Flash"`。
+
+## 独立读取数据 + 重命名列名 + 筛选Rater
+
+```{r}
+Gender_alldata_deepseekv4 <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_gender.xlsx")
+Group_alldata_deepseekv4  <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_group.xlsx")
+Gender_ID_deepseekv4 <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/HC_Gender.xlsx")
+
+# 原始数据里这个模型的Rater写的是"Deepseek-V4-Flash"（小写e），统一改成"DeepSeek-V4-Flash"（大写S）
+Gender_alldata_deepseekv4 <- Gender_alldata_deepseekv4 %>% mutate(Rater = if_else(Rater == "Deepseek-V4-Flash", "DeepSeek-V4-Flash", Rater))
+Group_alldata_deepseekv4  <- Group_alldata_deepseekv4  %>% mutate(Rater = if_else(Rater == "Deepseek-V4-Flash", "DeepSeek-V4-Flash", Rater))
+
+colnames(Gender_alldata_deepseekv4)[6:31] <- ng_q_names
+colnames(Group_alldata_deepseekv4)[6:31]  <- ng_q_names
+
+deepseekv4_rater <- "DeepSeek-V4-Flash"
+keep_raters_deepseekv4 <- c(deepseekv4_rater, "Human")
+
+Gender_alldata_deepseekv4 <- Gender_alldata_deepseekv4 %>% filter(Rater %in% keep_raters_deepseekv4)
+Group_alldata_deepseekv4  <- Group_alldata_deepseekv4  %>% filter(Rater %in% keep_raters_deepseekv4)
+
+# 确认筛选后两个Rater都有数据（不是0行，防止字符串没匹配上被静默丢弃）
+table(Gender_alldata_deepseekv4$Rater)
+table(Group_alldata_deepseekv4$Rater)
+```
+
+## 合并性别信息（Gender_alldata_deepseekv4 本身没有 Gender 列，用 Sub_ID 从 Gender_ID_deepseekv4 关联进来）
+
+```{r}
+Gender_alldata_deepseekv4 <- Gender_alldata_deepseekv4 %>%
+  left_join(Gender_ID_deepseekv4 %>% select(Sub_ID, Gender), by = "Sub_ID")
+
+# 检查有没有没匹配上性别的被试（应为0行）
+Gender_alldata_deepseekv4 %>% filter(is.na(Gender)) %>% distinct(Sub_ID)
+```
+
+Group_alldata_deepseekv4 里 Group 列是原始数据自带的，不用额外merge。
+
+## Gender：片段水平合成 Human vs DeepSeekV4Flash
+
+```{r}
+Gender_segment_composite_deepseekv4 <- Gender_alldata_deepseekv4 %>%
+  select(Participant_ID, Sub_ID, Gender, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == deepseekv4_rater, "DeepSeekV4Flash", Rater))
+
+dim(Gender_segment_composite_deepseekv4)
+table(Gender_segment_composite_deepseekv4$Rater)
+```
+
+## Gender：被试水平聚合
+
+```{r}
+Gender_composite_deepseekv4 <- Gender_segment_composite_deepseekv4 %>%
+  group_by(Sub_ID, Gender, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Gender_composite_deepseekv4)
+table(Gender_composite_deepseekv4$Rater, Gender_composite_deepseekv4$Gender)
+```
+
+## Gender：正态性检验（复用 `normality_check()`）
+
+```{r}
+normality_results_deepseekv4 <- Gender_composite_deepseekv4 %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23)) %>%
+  ungroup()
+
+normality_results_deepseekv4 %>% arrange(Rater, shapiro_p)
+
+normality_results_deepseekv4 %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(normality_results_deepseekv4,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_deepseekv4_normality.xlsx")
+```
+
+## Gender：Mann-Whitney U 检验，FDR校正
+
+```{r}
+mwu_results_deepseekv4 <- Gender_composite_deepseekv4 %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Gender)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Gender == grp_levels[1]]
+      y <- .x[[v]][.x$Gender == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+mwu_results_deepseekv4 %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+gender_desc_deepseekv4 <- Gender_composite_deepseekv4 %>%
+  group_by(Rater, Gender) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Gender), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Gender, stat), values_from = value, names_glue = "{Gender}_{stat}")
+
+mwu_results_deepseekv4 <- mwu_results_deepseekv4 %>%
+  left_join(gender_desc_deepseekv4, by = c("Rater", "variable")) %>%
+  relocate(starts_with("female_"), starts_with("male_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+mwu_results_deepseekv4 %>% arrange(Rater, q)
+
+write_xlsx(mwu_results_deepseekv4,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904gender_deepseekv4_mwu.xlsx")
+```
+
+## Group（HC vs MDD）：片段水平合成 + 被试水平聚合
+
+```{r}
+Group_segment_composite_deepseekv4 <- Group_alldata_deepseekv4 %>%
+  select(Participant_ID, Sub_ID, Group, Rater, all_of(dims_23)) %>%
+  mutate(Rater = if_else(Rater == deepseekv4_rater, "DeepSeekV4Flash", Rater))
+
+dim(Group_segment_composite_deepseekv4)
+table(Group_segment_composite_deepseekv4$Rater)
+
+Group_composite_deepseekv4 <- Group_segment_composite_deepseekv4 %>%
+  group_by(Sub_ID, Group, Rater) %>%
+  summarise(across(all_of(dims_23), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dim(Group_composite_deepseekv4)
+table(Group_composite_deepseekv4$Rater, Group_composite_deepseekv4$Group)
+```
+
+## Group：正态性检验
+
+```{r}
+group_normality_results_deepseekv4 <- Group_composite_deepseekv4 %>%
+  group_by(Rater) %>%
+  group_modify(~ normality_check(.x, dims_23, group_var = "Group")) %>%
+  ungroup()
+
+group_normality_results_deepseekv4 %>% arrange(Rater, shapiro_p)
+
+group_normality_results_deepseekv4 %>%
+  group_by(Rater) %>%
+  summarise(n_tests = n(), n_nonnormal = sum(shapiro_p < .05), .groups = "drop")
+
+write_xlsx(group_normality_results_deepseekv4,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_deepseekv4_normality.xlsx")
+```
+
+## Group：Mann-Whitney U 检验，FDR校正
+
+```{r}
+group_mwu_results_deepseekv4 <- Group_composite_deepseekv4 %>%
+  group_by(Rater) %>%
+  group_modify(~ {
+    n_by_group <- table(.x$Group)
+    grp_levels <- names(n_by_group)
+    n1 <- as.numeric(n_by_group[1])
+    n2 <- as.numeric(n_by_group[2])
+    N  <- n1 + n2
+
+    map_dfr(dims_23, function(v) {
+      x <- .x[[v]][.x$Group == grp_levels[1]]
+      y <- .x[[v]][.x$Group == grp_levels[2]]
+
+      test <- wilcox.test(x, y)
+      U <- unname(test$statistic)
+      p <- test$p.value
+
+      ranks <- rank(c(x, y))
+      mu <- n1 * n2 / 2
+      ties <- table(ranks)
+      sigma <- sqrt((n1 * n2 / 12) * ((N + 1) - sum(ties^3 - ties) / (N * (N - 1))))
+      correction <- sign(U - mu) * 0.5
+      Z <- (U - mu - correction) / sigma
+      r <- Z / sqrt(N)
+      tibble(variable = v, n1 = n1, n2 = n2, N = N, U = U, Z = Z, p = p, r = r)
+    })
+  }) %>%
+  ungroup() %>%
+  group_by(Rater) %>%
+  mutate(q = p.adjust(p, method = "fdr")) %>%
+  ungroup() %>%
+  mutate(sig_label = case_when(
+    q < .001 ~ "***",
+    q < .01  ~ "**",
+    q < .05  ~ "*",
+    TRUE     ~ "n.s."
+  ))
+
+group_mwu_results_deepseekv4 %>% arrange(Rater, q)
+```
+
+补上每组的描述统计并导出：
+
+```{r}
+group_desc_deepseekv4 <- Group_composite_deepseekv4 %>%
+  group_by(Rater, Group) %>%
+  summarise(across(all_of(dims_23),
+                    list(mean = ~mean(.x, na.rm = TRUE),
+                         sd = ~sd(.x, na.rm = TRUE),
+                         median = ~median(.x, na.rm = TRUE),
+                         IQR = ~IQR(.x, na.rm = TRUE)),
+                    .names = "{.fn}__{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(-c(Rater, Group), names_to = c("stat", "variable"), names_sep = "__", values_to = "value") %>%
+  pivot_wider(names_from = c(Group, stat), values_from = value, names_glue = "{Group}_{stat}")
+
+group_mwu_results_deepseekv4 <- group_mwu_results_deepseekv4 %>%
+  left_join(group_desc_deepseekv4, by = c("Rater", "variable")) %>%
+  relocate(starts_with("HC_"), starts_with("MDD_"), .after = variable) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+group_mwu_results_deepseekv4 %>% arrange(Rater, q)
+
+write_xlsx(group_mwu_results_deepseekv4,
+           "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/0904group_deepseekv4_mwu.xlsx")
+```
+
+
+# 复现热力图：Human vs 5档LLM（Primary LLM mean / Low-cost LLM mean / DeepSeek-V4-Flash / GPT-5-mini / Gemini-2.5-Flash-Lite）
+
+这一节完全独立，不依赖前面任何chunk是否已经跑过：直接从磁盘上各节已经导出的xlsx结果文件重新读取（`gender_low_mwu_results.xlsx` / `group_low_mwu_results.xlsx` 是 Human + Low-cost LLM mean【4模型均分：Qwen-3.5-27B / DeepSeek-V4-Flash / Gemini-2.5Flash-Lite / GPT-5mini】，`gender_gemini2.5_mwu_results.xlsx` / `group_gemini2.5_mwu_results.xlsx` 是 Gemini-2.5-Flash-Lite，`gender_gpt5mini_mwu_results.xlsx` / `group_gpt5mini_mwu_results.xlsx` 是 GPT-5-mini，`gender_qwen_mwu_results.xlsx` / `group_qwen_mwu_results.xlsx` 是 Qwen-3.5-27B，`gender_deepseekv4_mwu_results.xlsx` / `group_deepseekv4_mwu_results.xlsx` 是 DeepSeek-V4-Flash，`0723mwu_results.xlsx` / `0723group_mwu_results.xlsx` 是 Primary LLM mean【6模型均分：Qwen-3.5-27B / Gemini-3.5-Flash / Claude-Sonnet4.6 / GPT-5.4 / GLM-5.1 / DeepSeek-V4-Pro】），前提是这几节之前至少完整跑过一次、xlsx已经生成在磁盘上。分类逻辑：以 Human 的显著性（FDR校正 q<.05）和效应方向（Z的正负号）为基准，跟每个LLM档位逐维度比较：
+
+- Human显著 + LLM显著 + 同方向 → **Concordant (significant)**
+- Human显著 + LLM显著 + 反方向 → **Discordant direction**（审稿人最关心的失败类型）
+- Human显著 + LLM不显著 → **Non-replicated**
+- Human不显著 + LLM显著（不分方向）→ **Additional detection**
+- 都不显著 → **Concordant (null)**
+
+Human这一行本身不参与上面5分类，单独用"显著/不显著"二色表示，作为参照行。
+
+## 独立读取各节已导出的检验结果 + Primary LLM mean
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(patchwork)
+
+dims_23 <- c("interoceptive", "internally focused", "externally focused", "self focused", "other focused",
+             "positive", "negative", "problem solving", "guilt", "concern", "anger", "disgust", "fear",
+             "sadness", "surprise", "happiness", "liking", "pleasure", "disappointment", "past", "future",
+             "present", "rumination")
+
+mwu_results_hm       <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904gender_mwu_mini.xlsx")
+group_mwu_results_hm <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904group_mwu_mini.xlsx")
+mwu_gemini_hm        <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904gender_gemini2.5_mwu.xlsx")
+group_gemini_hm      <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904group_gemini2.5_mwu.xlsx")
+mwu_gpt5mini_hm      <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904gender_gpt5mini_mwu.xlsx")
+group_gpt5mini_hm    <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904group_gpt5mini_mwu.xlsx")
+mwu_deepseekv4_hm    <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904gender_deepseekv4_mwu.xlsx")
+group_deepseekv4_hm  <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/mini/mwu/0904group_deepseekv4_mwu.xlsx")
+
+flagship_mwu_gender <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/0723mwu_results.xlsx", sheet = 1)
+flagship_mwu_group  <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/0723group_mwu_results.xlsx", sheet = 1)
+```
+
+诊断一下这两个flagship文件实际的列名，以及 Rater 列（如果存在）里都有哪些取值：
+
+```{r}
+names(flagship_mwu_gender)
+names(flagship_mwu_group)
+
+if ("Rater" %in% names(flagship_mwu_gender)) flagship_mwu_gender %>% count(Rater)
+if ("Rater" %in% names(flagship_mwu_group))  flagship_mwu_group  %>% count(Rater)
+```
+
+## 汇总6条Rater线（Human + 5档LLM）的显著性与方向
+
+```{r}
+extract_sig <- function(df, rater_value, label) {
+  df %>%
+    filter(Rater == rater_value) %>%
+    transmute(variable, rater = label, significant = q < .05, direction = sign(Z))
+}
+
+gender_sig_raw <- bind_rows(
+  extract_sig(mwu_results_hm, "Human", "Human"),
+  extract_sig(flagship_mwu_gender, "LLM_mean", "Primary LLM mean"),
+  extract_sig(mwu_results_hm, "LLM_mean", "Low-cost LLM mean"),
+  extract_sig(mwu_deepseekv4_hm, "DeepSeekV4Flash", "DeepSeek-V4-Flash"),
+  extract_sig(mwu_gpt5mini_hm, "GPT5mini", "GPT-5-mini"),
+  extract_sig(mwu_gemini_hm, "Gemini", "Gemini-2.5-Flash-Lite")
+)
+
+group_sig_raw <- bind_rows(
+  extract_sig(group_mwu_results_hm, "Human", "Human"),
+  extract_sig(flagship_mwu_group, "LLM_mean", "Primary LLM mean"),
+  extract_sig(group_mwu_results_hm, "LLM_mean", "Low-cost LLM mean"),
+  extract_sig(group_deepseekv4_hm, "DeepSeekV4Flash", "DeepSeek-V4-Flash"),
+  extract_sig(group_gpt5mini_hm, "GPT5mini", "GPT-5-mini"),
+  extract_sig(group_gemini_hm, "Gemini", "Gemini-2.5-Flash-Lite")
+)
+```
+
+
+## 按 Concordant (significant) / Discordant direction / Non-replicated / Additional detection / Concordant (null) 分类
+
+```{r}
+classify_heatmap <- function(sig_raw) {
+  human_ref <- sig_raw %>%
+    filter(rater == "Human") %>%
+    select(variable, human_sig = significant, human_dir = direction)
+
+  llm_part <- sig_raw %>%
+    filter(rater != "Human") %>%
+    left_join(human_ref, by = "variable") %>%
+    mutate(cell_class = case_when(
+      human_sig & significant & direction == human_dir ~ "Concordant (significant)",
+      human_sig & significant & direction != human_dir ~ "Discordant direction",
+      human_sig & !significant                          ~ "Non-replicated",
+      !human_sig & significant                           ~ "Additional detection",
+      TRUE                                                ~ "Concordant (null)"
+    )) %>%
+    select(variable, rater, cell_class)
+
+  human_part <- sig_raw %>%
+    filter(rater == "Human") %>%
+    mutate(cell_class = if_else(significant, "Human: significant", "Human: not significant")) %>%
+    select(variable, rater, cell_class)
+
+  bind_rows(llm_part, human_part)
+}
+
+gender_heatmap_data <- classify_heatmap(gender_sig_raw)
+group_heatmap_data  <- classify_heatmap(group_sig_raw)
+
+# 每类格子数量速览
+gender_heatmap_data %>% count(cell_class)
+group_heatmap_data  %>% count(cell_class)
+```
+
+## 配色、行/列顺序，画图
+
+行顺序按"贵到便宜"排列、Human放最上面；5类结果用色觉友好的固定语义色（绿=Concordant (significant)、红=Discordant direction、橙=Non-replicated、蓝=Additional detection、浅灰=Concordant (null)），Human参照行单独上色，跟下面5档LLM的彩色区分开：
+
+```{r, fig.width=14, fig.height=9.3}
+rater_order <- c("Gemini-2.5-Flash-Lite", "GPT-5-mini", "DeepSeek-V4-Flash", "Low-cost LLM mean", "Primary LLM mean", "Human")
+
+cell_levels <- c("Human: significant", "Human: not significant",
+                 "Concordant (significant)", "Discordant direction", "Non-replicated", "Additional detection", "Concordant (null)")
+
+heatmap_colors <- c(
+  "Human: significant"     = "#d6e4cc",
+  "Human: not significant" = "#dcdbd5",
+  "Concordant (significant)"                    = "#d6e4cc",
+  "Discordant direction"               = "#e24a4aa7",
+  "Non-replicated"                   = "#96b4d3",
+  "Additional detection"            = "#ebd49c",
+  "Concordant (null)"      = "#dcdbd5"
+)
+
+dims_23_ordered <- c(setdiff(dims_23, "problem solving"), "problem solving")
+
+prep_heatmap_df <- function(df) {
+  df %>%
+    mutate(
+      rater = factor(rater, levels = rater_order),
+      variable = factor(str_to_sentence(variable), levels = str_to_sentence(dims_23_ordered)),
+      cell_class = factor(cell_class, levels = cell_levels)
+    )
+}
+
+gender_heatmap_data <- prep_heatmap_df(gender_heatmap_data)
+group_heatmap_data  <- prep_heatmap_df(group_heatmap_data)
+
+plot_recovery_heatmap <- function(df, show_legend = TRUE) {
+  p <- ggplot(df, aes(x = variable, y = rater, fill = cell_class)) +
+    geom_tile(color = "white", linewidth = 0.6) +
+    geom_text(
+      data = dplyr::filter(df, cell_class == "Human: significant"),
+      label = "*", color = "black", size = 5, fontface = "bold", vjust = 0.7
+    ) +
+    scale_fill_manual(
+      values = heatmap_colors,
+      breaks = setdiff(cell_levels, c("Human: significant", "Human: not significant")),
+      drop = FALSE, name = NULL
+    ) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black", margin = margin(t = 1)),
+      axis.text.y = element_text(face = "bold", color = "black", margin = margin(r = 1)),
+      panel.grid = element_blank(),
+      legend.position = "bottom",
+      legend.title = element_blank(),
+      legend.text = element_text(face = "bold", color = "black")
+    ) +
+    guides(fill = guide_legend(nrow = 1, override.aes = list(color = "grey30")))
+
+  if (!show_legend) p <- p + theme(legend.position = "none")
+  p
+}
+
+heatmap_gender <- plot_recovery_heatmap(gender_heatmap_data, show_legend = FALSE)
+heatmap_group  <- plot_recovery_heatmap(group_heatmap_data, show_legend = TRUE)
+
+heatmap_combined <- heatmap_gender / heatmap_group
+
+heatmap_combined
+```
+
+```{r}
+ggsave("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/0904Heatmap_combined.tif", plot = heatmap_combined, width = 9, height = 9.3)
+```
+
+## 同一张热力图，仅保留 DeepSeek-V4-Flash / Low-cost LLM mean / Primary LLM mean / Human 四行
+
+```{r, fig.width=14, fig.height=6.6}
+rater_order_4 <- c("DeepSeek-V4-Flash", "Low-cost LLM mean", "Primary LLM mean", "Human")
+
+prep_heatmap_df_4 <- function(df) {
+  df %>%
+    filter(rater %in% rater_order_4) %>%
+    mutate(rater = factor(rater, levels = rater_order_4))
+}
+
+gender_heatmap_data_4 <- prep_heatmap_df_4(gender_heatmap_data)
+group_heatmap_data_4  <- prep_heatmap_df_4(group_heatmap_data)
+
+heatmap_gender_4 <- plot_recovery_heatmap(gender_heatmap_data_4, show_legend = FALSE)
+heatmap_group_4  <- plot_recovery_heatmap(group_heatmap_data_4, show_legend = TRUE)
+
+heatmap_combined_4 <- heatmap_gender_4 / heatmap_group_4
+
+heatmap_combined_4
+```
+
+```{r}
+ggsave("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/0904Heatmap_combined_4raters.tif", plot = heatmap_combined_4, width = 18, height = 6.6)
+```
+
+## 四行版本合并为一张图，只保留一行横坐标 label，用 facet 分栏区分"性别差异" vs "诊断组别差异"
+
+用 `facet_grid(analysis ~ .)` 把两组数据叠在同一个绘图对象里：ggplot 对共享 x 轴的多行 facet 默认只在最底部画一次横坐标 label；每个 facet 左侧的条形标签（strip）分别标注 "Gender difference" / "Diagnostic group difference" 来区分两种比较：
+
+```{r, fig.width=14, fig.height=6.6}
+combined_4_data <- bind_rows(
+  gender_heatmap_data_4 %>% mutate(analysis = "Gender difference"),
+  group_heatmap_data_4  %>% mutate(analysis = "Diagnostic group difference")
+) %>%
+  mutate(analysis = factor(analysis, levels = c("Gender difference", "Diagnostic group difference")))
+
+heatmap_combined_4_facet <- ggplot(combined_4_data, aes(x = variable, y = rater, fill = cell_class)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(
+    data = dplyr::filter(combined_4_data, cell_class == "Human: significant"),
+    label = "*", color = "black", size = 5, fontface = "bold", vjust = 0.7
+  ) +
+  scale_fill_manual(
+    values = heatmap_colors,
+    breaks = setdiff(cell_levels, c("Human: significant", "Human: not significant")),
+    drop = FALSE, name = NULL
+  ) +
+  facet_grid(analysis ~ ., switch = "y") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(size = 13, angle = 45, hjust = 1, face = "bold", color = "black", margin = margin(t = 1)),
+    axis.text.y = element_text(size = 13, face = "bold", color = "black", margin = margin(r = 1)),
+    panel.grid = element_blank(),
+    panel.spacing.y = unit(0.8, "lines"),
+    strip.background = element_blank(),
+    strip.text.y.left = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 13, face = "bold", color = "black"),
+    legend.key.size = unit(0.8, "cm")
+  ) +
+  guides(fill = guide_legend(nrow = 1, override.aes = list(color = "grey30")))
+
+heatmap_combined_4_facet
+```
+
+```{r}
+ggsave("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/0930Heatmap_combined_4raters_facet.tif", plot = heatmap_combined_4_facet, width = 18, height = 6.6)
+```
+
+
+
+
+
+
+
+
+
+
+

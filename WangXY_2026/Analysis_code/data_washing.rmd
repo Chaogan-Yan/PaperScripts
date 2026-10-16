@@ -1,0 +1,135 @@
+
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(irr)
+library(patchwork)
+library(broom)
+library(stringr)
+library(writexl)
+library(patchwork)
+library(forcats)
+library(openxlsx)
+library(psych)
+```
+
+
+```{r}
+llm_alldata <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/M_rater_all_data.xlsx")
+
+Gender_ID <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/HC_Gender.xlsx")
+
+Group_ID <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/MDD_HC_ID.xlsx")
+
+
+```
+
+```{r}
+# 转义正则特殊字符，避免Sub_ID中若含有. ( ) 等符号时被误解析
+escape_ids <- function(ids) {
+  str_replace_all(ids, "([\\.\\^\\$\\|\\(\\)\\[\\]\\{\\}\\*\\+\\?\\\\])", "\\\\\\1")
+}
+
+# 用Group_ID的Sub_ID筛选
+# Sub_ID开头是数字的（如"5_sub001_MDD"）：Participant_ID只要包含该Sub_ID即保留
+# Sub_ID开头是"S"的（如"Sub001"）：只保留Participant_ID以该Sub_ID + "_S1D1"开头的行（如"Sub001_S1D1*"）
+group_ids_digit <- Group_ID$Sub_ID[str_detect(Group_ID$Sub_ID, "^[0-9]")]
+group_ids_s     <- Group_ID$Sub_ID[!str_detect(Group_ID$Sub_ID, "^[0-9]")]
+
+digit_pattern <- paste(escape_ids(group_ids_digit), collapse = "|")
+s_pattern     <- paste0("^(", paste(escape_ids(group_ids_s), collapse = "|"), ")_S1D1")
+
+llm_alldata_group <- llm_alldata %>%
+  filter(str_detect(Participant_ID, digit_pattern) |
+         str_detect(Participant_ID, s_pattern))
+
+# 用Gender_ID的Sub_ID筛选，只要Participant_ID包含其中任意一个Sub_ID即保留
+gender_pattern <- paste(escape_ids(Gender_ID$Sub_ID), collapse = "|")
+
+llm_alldata_gender <- llm_alldata %>%
+  filter(str_detect(Participant_ID, gender_pattern))
+```
+
+```{r}
+# 对llm_alldata_gender中Participant_ID以"1"开头的行，只保留第10-13个字符为"E1S2"的行
+# 不以"1"开头的行不受此限制，保持不变
+llm_alldata_gender <- llm_alldata_gender %>%
+  filter(!str_detect(Participant_ID, "^1") |
+         substr(Participant_ID, 10, 13) == "E1S2")
+```
+
+```{r}
+# 额外补充4个特定session的行（不受上面E1S2限制），合并进llm_alldata_gender
+extra_ids_gender <- c("1_sub030_E1S3", "1_sub016_E2S2", "1_sub028_E2S2", "1_sub015_E2S3")
+
+extra_pattern_gender <- paste0("^(", paste(escape_ids(extra_ids_gender), collapse = "|"), ")")
+
+llm_alldata_extra_gender <- llm_alldata %>%
+  filter(str_detect(Participant_ID, extra_pattern_gender))
+
+llm_alldata_gender <- bind_rows(llm_alldata_gender, llm_alldata_extra_gender) %>%
+  distinct()
+```
+
+```{r}
+# 额外补充6个特定session的行（不受上面_S1D1限制），合并进llm_alldata_group
+extra_ids <- c("Sub023_S1D2", "Sub107_S1D2", "Sub607_S1D2",
+               "Sub608_S1D2", "Sub626_S1D2", "Sub020_S2D1")
+
+extra_pattern <- paste0("^(", paste(escape_ids(extra_ids), collapse = "|"), ")")
+
+llm_alldata_extra <- llm_alldata %>%
+  filter(str_detect(Participant_ID, extra_pattern))
+
+llm_alldata_group <- bind_rows(llm_alldata_group, llm_alldata_extra) %>%
+  distinct()
+```
+
+
+```{r}
+# 根据Participant_ID反查其对应的被试编号（Sub_ID），写入新列
+# 逻辑：Group_ID$Sub_ID / Gender_ID$Sub_ID 中的每个值本身就是Participant_ID中
+# 可以找到的一段子串（无论是数字开头的"5_sub001_MDD"这种完整编号，
+# 还是"S"开头的"Sub001"这种基础编号，包括各自的extra补充行也都对应
+# 这两份名单里已有的Sub_ID），因此按长度从长到短排序后做一次性的正则
+# 提取，就能唯一确定每行文本所属的被试编号，且不会被更短的编号误匹配
+extract_sub_id <- function(participant_ids, sub_id_list) {
+  candidates <- sub_id_list[order(-nchar(sub_id_list))]
+  pattern <- paste0("(", paste(escape_ids(candidates), collapse = "|"), ")")
+  str_extract(participant_ids, pattern)
+}
+
+llm_alldata_group <- llm_alldata_group %>%
+  mutate(Sub_ID = extract_sub_id(Participant_ID, Group_ID$Sub_ID)) %>%
+  relocate(Sub_ID, .after = Participant_ID)
+
+llm_alldata_gender <- llm_alldata_gender %>%
+  mutate(Sub_ID = extract_sub_id(Participant_ID, Gender_ID$Sub_ID)) %>%
+  relocate(Sub_ID, .after = Participant_ID)
+
+# 检查是否存在未能匹配到被试编号的行，理论上应均为0
+sum(is.na(llm_alldata_group$Sub_ID))
+sum(is.na(llm_alldata_gender$Sub_ID))
+```
+
+```{r}
+write_xlsx(llm_alldata_group, "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_group.xlsx")
+write_xlsx(llm_alldata_gender, "D:/2025THU/SELF_OTHER/LLMRating_Task/draft/Group_analysis/llm_alldata_gender.xlsx")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

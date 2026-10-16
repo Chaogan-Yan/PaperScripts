@@ -1,0 +1,1015 @@
+---
+title: "new_analysis"
+output: html_document
+date: "2026-04-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(irr)
+library(patchwork)
+library(broom)
+library(stringr)
+library(writexl)
+library(forcats)
+library(openxlsx)
+library(psych)
+library(ggbeeswarm)
+library(ggh4x)
+```
+
+```{r}
+llm_alldata <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/M_rater_all_data.xlsx")
+
+llm_alldata <- llm_alldata %>%
+  filter(substr(Participant_ID, 1, 6) != "Sub201")
+
+```
+
+```{r}
+raters_keep1 <- c(
+  "Qwen-3.5-27B",
+  "Gemini-3.5-Flash",
+  "Claude-Sonnet4.6",
+  "GPT-5.4",
+  "Human",
+  "GLM-5",
+  "DeepSeek-V4-Pro"
+)
+
+raters_keep2 <- c(
+  "Deepseek-V3.2",
+  "DeepSeek-V3",
+  "Gemini-2.5Flash-Lite",
+  "Gemini-3.1-Pro-Preview",
+  "GPT-4omini",
+  "GPT-5mini",
+  "Human"
+)
+
+llm_analysis1 <- llm_alldata %>%
+  filter(Rater %in% raters_keep1)
+
+llm_analysis2 <- llm_alldata %>%
+  filter(Rater %in% raters_keep2)
+```
+
+```{r}
+llm_raters1 <- c(
+  "Qwen-3.5-27B",
+  "Gemini-3.5-Flash",
+  "Claude-Sonnet4.6",
+  "GPT-5.4",
+  "GLM-5",
+  "DeepSeek-V4-Pro"
+)
+
+q_names <- names(llm_analysis1)[6:ncol(llm_analysis1)]
+
+#抑郁症汇报的可能性-rating of depression; 
+#1、thinking perceptual orientation: #本体感觉-interoceptive;内部导向-internally-focused;外部导向-externally
+#2、social dimension:自我-self-focused;他人-other-focused      
+#3、valence:积极的事情-positive;消极的事情-negative          
+#4、thinking style:问题解决-problem-solving;反省-reflection;反刍-rumination
+#5、emotional experience:
+#自责-guilt;担忧-concern;生气-anger             |negative emotions
+#厌恶-disgust;悲伤-sadness;失望-disappointment  |negative emotions
+#幸福-happiness;喜欢-liking;愉悦-pleasure        |positive emotions 
+#惊喜-surprise;恐惧-fear;自卑-self-abasement;
+#6、temporal dimension:关注过去-past;关注未来-future;关注当下-present      
+
+Eng_q_names <- c("rating of depression", "interoceptive", "internally focused", "externally focused", "self focused", "other focused", "positive", "negative", "problem solving", "guilt", "concern", "anger", "disgust", "fear", "sadness", "surprise", "happiness", "liking", "pleasure", "self-abasement", "disappointment", "reflection", "past", "future", "present", "rumination")
+
+names(llm_analysis1)[6:ncol(llm_analysis1)] <- Eng_q_names
+
+
+```
+
+```{r}
+llms_mean1 <- llm_analysis1 %>%
+  dplyr::filter(Rater %in% llm_raters1) %>%
+  group_by(Participant_ID) %>%
+  summarise(
+    Sub_ID   = first(Sub_ID),
+    Response = first(Response),
+    Group    = first(Group),
+    across(all_of(Eng_q_names), ~mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(Rater = "LLMs_mean") %>%
+  dplyr::select(Participant_ID, Sub_ID, Response, Group, Rater, everything())
+
+llms_analysis1 <- bind_rows(llm_analysis1, llms_mean1)
+```
+
+
+
+```{r}
+write_xlsx(llms_analysis1, "D:/2025THU/SELF_OTHER/LLMRating_Task/LLMs_analysis1.xlsx")
+```
+
+#1、计算LLM与人类评分相关系数
+```{r}
+#人类评分
+human_scores1 <- llms_analysis1 %>%
+  dplyr::filter(Rater == "Human") %>%
+  dplyr::select(Participant_ID, all_of(Eng_q_names))
+
+#计算 Pearson r（LLM vs 人类均分，按维度）
+raters_to_plot1 <- c(llm_raters1, "LLMs_mean")
+
+compute_r <- function(data, rater_name, human_df, dims) {
+  llm_scores <- data %>%
+    dplyr::filter(Rater == rater_name) %>%
+    dplyr::select(Participant_ID, all_of(dims))
+
+  merged <- inner_join(human_df, llm_scores,
+                       by = "Participant_ID",
+                       suffix = c("_human", "_llm"))
+
+  map_dfr(dims, function(dim) {
+    h <- merged[[paste0(dim, "_human")]]
+    l <- merged[[paste0(dim, "_llm")]]
+
+    ct <- cor.test(h, l, use = "complete.obs", method = "pearson")
+
+    tibble(
+      Dimension = dim,
+      Rater     = rater_name,
+      r         = unname(ct$estimate),
+      p         = ct$p.value,
+      ci_low    = ct$conf.int[1],
+      ci_high   = ct$conf.int[2],
+      n         = sum(complete.cases(h, l))
+    )
+  })
+}
+
+corr_llms1 <- map_dfr(raters_to_plot1, ~compute_r(llms_analysis1, .x, human_scores1, Eng_q_names))
+
+# FDR (Benjamini-Hochberg) 校正：把全部 rater x dimension 的检验当作一个整体 family
+corr_llms1 <- corr_llms1 %>%
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    sig_fdr = p_fdr < 0.05
+  )
+
+```
+
+```{r}
+write_xlsx(corr_llms1, "D:/2025THU/SELF_OTHER/LLMRating_Task/0720corr_llms1.xlsx")
+```
+
+#2、被试水平：先按被试（Sub_ID）聚合，再计算LLM与人类评分相关系数
+```{r}
+# 被试水平聚合：每个 Sub_ID x Rater，把该被试名下所有文本在26个维度上取均值
+llms_analysis1_sub <- llms_analysis1 %>%
+  group_by(Sub_ID, Rater) %>%
+  summarise(
+    Group = first(Group),
+    across(all_of(Eng_q_names), ~mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+```
+
+```{r}
+#人类评分（被试水平）
+human_scores1_sub <- llms_analysis1_sub %>%
+  dplyr::filter(Rater == "Human") %>%
+  dplyr::select(Sub_ID, all_of(Eng_q_names))
+
+#计算 Pearson r（LLM vs 人类均分，按维度，被试水平）
+compute_r_sub <- function(data, rater_name, human_df, dims) {
+  llm_scores <- data %>%
+    dplyr::filter(Rater == rater_name) %>%
+    dplyr::select(Sub_ID, all_of(dims))
+
+  merged <- inner_join(human_df, llm_scores,
+                       by = "Sub_ID",
+                       suffix = c("_human", "_llm"))
+
+  map_dfr(dims, function(dim) {
+    h <- merged[[paste0(dim, "_human")]]
+    l <- merged[[paste0(dim, "_llm")]]
+
+    ct <- cor.test(h, l, use = "complete.obs", method = "pearson")
+
+    tibble(
+      Dimension = dim,
+      Rater     = rater_name,
+      r         = unname(ct$estimate),
+      p         = ct$p.value,
+      ci_low    = ct$conf.int[1],
+      ci_high   = ct$conf.int[2],
+      n         = sum(complete.cases(h, l))
+    )
+  })
+}
+
+corr_llms1_sub <- map_dfr(raters_to_plot1, ~compute_r_sub(llms_analysis1_sub, .x, human_scores1_sub, Eng_q_names))
+
+# FDR (Benjamini-Hochberg) 校正：把全部 rater x dimension 的检验当作一个整体 family
+corr_llms1_sub <- corr_llms1_sub %>%
+  mutate(
+    p_fdr = p.adjust(p, method = "BH"),
+    sig_fdr = p_fdr < 0.05
+  )
+```
+
+```{r}
+write_xlsx(corr_llms1_sub_cat, "D:/2025THU/SELF_OTHER/LLMRating_Task/0903corr_subject.xlsx")
+```
+
+#画图
+```{r}
+# 定义各类型包含的维度
+dims_perceptual  <- c("interoceptive", "internally focused", 
+                      "externally focused", "problem solving", 
+                      "reflection", "rumination", "self focused", "other focused", 
+                      "past", "future", "present")
+
+dims_emotional   <- c("positive", "negative", "guilt", "concern", "anger", "disgust", "sadness", 
+                      "disappointment", "happiness", "liking", "pleasure", 
+                      "surprise", "fear", "self-abasement", "rating of depression")
+
+
+# ICC 部分尚未计算（上面被注释掉），按维度筛选相关系数结果 corr_llms1
+data_perceptual <- corr_llms1 %>% filter(Dimension %in% dims_perceptual)
+data_emotional  <- corr_llms1 %>% filter(Dimension %in% dims_emotional)
+```
+
+```{r}
+rater_colors <- c(
+  "Qwen-3.5-27B"          = "#4878CF",
+  "Gemini-3.5-Flash"      = "#7B2D8B",
+  "Claude-Sonnet4.6"      = "#F18F01",
+  "GPT-5.4"               = "#3D7A3D",
+  "DeepSeek-V4-Pro"       = "#DC143C",
+  "GLM-5"               = "#7B3F00",
+  "LLMs_mean"             = "#555555"
+)
+
+rater_shapes <- c(
+  "Qwen-3.5-27B"          = 16,
+  "Gemini-3.5-Flash"      = 16,
+  "Claude-Sonnet4.6"      = 16,
+  "GPT-5.4"               = 16,
+  "DeepSeek-V4-Pro"       = 16,
+  "GLM-5"               = 16,
+  "LLMs_mean"             = 18  # 钻石形，对应原图黑钻
+)
+
+plot_correlation <- function(df, value_col, xlab, title) {
+  
+  df_llm  <- df %>% filter(Rater != "LLMs_mean")
+  df_mean <- df %>% filter(Rater == "LLMs_mean")
+  
+  dim_levels <- levels(factor(df_llm$Dimension))
+  
+  df_llm <- df_llm %>%
+    mutate(
+      Rater      = factor(Rater, levels = names(rater_colors)),
+      Dimension  = factor(Dimension, levels = dim_levels),
+      Dim_num    = as.numeric(Dimension)
+    )
+  
+  df_mean <- df_mean %>%
+    mutate(
+      Rater      = factor(Rater, levels = names(rater_colors)),
+      Dimension  = factor(Dimension, levels = dim_levels),
+      Dim_num    = as.numeric(Dimension) - 0.3  # LLMs_mean向下偏移
+    )
+  
+  ggplot() +
+    geom_beeswarm(
+      data = df_llm,
+      aes(x = .data[[value_col]], y = Dim_num, color = Rater, shape = Rater),
+      cex = 1.5, alpha = 0.9, size = 2.5
+    ) +
+    geom_point(
+      data = df_mean,
+      aes(x = .data[[value_col]], y = Dim_num, color = Rater, shape = Rater),
+      size = 4, alpha = 0.9
+    ) +
+    scale_color_manual(values = rater_colors) +
+    scale_shape_manual(values = rater_shapes) +
+    scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+    scale_y_continuous(
+      breaks = 1:length(dim_levels),
+      labels = dim_levels
+    ) +
+    labs(
+      title = title,
+      x     = xlab,
+      y     = NULL,
+      color = NULL,
+      shape = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.line.y      = element_line(),
+      axis.line.x      = element_line(),
+      axis.ticks       = element_line(),
+      legend.position  = "top",
+      plot.title       = element_text(hjust = 0.5, face = "bold"),
+      axis.text.y      = element_text(size = 12, face = "bold"),
+      axis.text.x      = element_text(size = 12, face = "bold"),
+      axis.title.x     = element_text(size = 12, face = "bold"),
+      legend.spacing.x = unit(0.1, "cm"),
+      legend.key.width = unit(1, "cm"),
+      legend.text      = element_text(size = 9, face = "bold")
+    ) +
+    guides(
+      color = guide_legend(nrow = 2, override.aes = list(size = 4)),
+      shape = guide_legend(nrow = 2)
+    )
+}
+
+```
+
+
+#画图v2：x轴=维度，y轴=r，分Emotional Experience和其余大类两张图
+```{r}
+# 按你给的6类划分，其余情感维度 + rating of depression 统一归入 Emotional Experience
+category_levels_corr <- c(
+  "Perceptual Orientation", "Social Dimension", "Temporal Dimension",
+  "Valence", "Thinking Style", "Emotional Experience"
+)
+
+corr_llms1_cat <- corr_llms1 %>%
+  mutate(
+    Category = case_when(
+      Dimension %in% c("interoceptive", "internally focused", "externally focused") ~ "Perceptual Orientation",
+      Dimension %in% c("self focused", "other focused") ~ "Social Dimension",
+      Dimension %in% c("past", "present", "future") ~ "Temporal Dimension",
+      Dimension %in% c("positive", "negative") ~ "Valence",
+      Dimension %in% c("problem solving", "reflection", "rumination", "rating of depression") ~ "Thinking Style",
+      TRUE ~ "Emotional Experience"
+    ),
+    Category = factor(Category, levels = category_levels_corr)
+  )
+
+data_emotional2  <- corr_llms1_cat %>% filter(Category == "Emotional Experience")
+```
+
+```{r}
+# 和原来plot_correlation一样的配色/形状，只是把x轴（维度）和y轴（r）对调
+# show_legend=FALSE 不显示图例；title_position="bottom" 把类型名当caption放在图底部
+plot_correlation_flipped <- function(df, value_col, ylab, title,
+                                      show_legend = TRUE, title_position = "top") {
+
+  df_llm  <- df %>% filter(Rater != "LLMs_mean")
+  df_mean <- df %>% filter(Rater == "LLMs_mean")
+
+  dim_levels <- levels(factor(df_llm$Dimension))
+
+  df_llm <- df_llm %>%
+    mutate(
+      Rater      = factor(Rater, levels = names(rater_colors)),
+      Dimension  = factor(Dimension, levels = dim_levels),
+      Dim_num    = as.numeric(Dimension)
+    )
+
+  df_mean <- df_mean %>%
+    mutate(
+      Rater      = factor(Rater, levels = names(rater_colors)),
+      Dimension  = factor(Dimension, levels = dim_levels),
+      Dim_num    = as.numeric(Dimension) - 0.3  # LLMs_mean向左偏移
+    )
+
+  p <- ggplot() +
+    geom_beeswarm(
+      data = df_llm,
+      aes(x = Dim_num, y = .data[[value_col]], color = Rater, shape = Rater),
+      cex = 1.5, alpha = 0.9, size = 2.5
+    ) +
+    geom_point(
+      data = df_mean,
+      aes(x = Dim_num, y = .data[[value_col]], color = Rater, shape = Rater),
+      size = 4, alpha = 0.9
+    ) +
+    scale_color_manual(values = rater_colors) +
+    scale_shape_manual(values = rater_shapes) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+    scale_x_continuous(
+      breaks = 1:length(dim_levels),
+      labels = dim_levels
+    ) +
+    labs(
+      title   = if (title_position == "top") title else NULL,
+      caption = if (title_position == "bottom") title else NULL,
+      y       = ylab,
+      x       = NULL,
+      color   = NULL,
+      shape   = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.line.y      = element_line(),
+      axis.line.x      = element_line(),
+      axis.ticks       = element_line(),
+      legend.position  = if (show_legend) "top" else "none",
+      plot.title       = element_text(hjust = 0.5, face = "bold"),
+      plot.caption     = element_text(hjust = 0.5, face = "bold", size = 12),
+      axis.text.x      = element_text(size = 12, face = "bold", angle = 45, hjust = 1),
+      axis.text.y      = element_text(size = 12, face = "bold"),
+      axis.title.y     = element_text(size = 12, face = "bold"),
+      legend.spacing.x = unit(0.1, "cm"),
+      legend.key.width = unit(1, "cm"),
+      legend.text      = element_text(size = 9, face = "bold")
+    )
+
+  if (show_legend) {
+    p <- p + guides(
+      color = guide_legend(nrow = 2, override.aes = list(size = 4)),
+      shape = guide_legend(nrow = 2)
+    )
+  }
+
+  p
+}
+```
+
+```{r}
+p_emotional2  <- plot_correlation_flipped(data_emotional2,  value_col = "r", ylab = "Correlation (r)", title = NULL)
+```
+
+```{r}
+# Emotional Experience条目多、更宽；另一大类维度数也不少，
+# 按各自的维度数设置画布宽度，高度统一方便你后续自己拼图对齐y轴
+# 注意：下面每张图的预览用了对应的 fig.width，就是靠这三个参数算出来的，
+# 不放在这个chunk之后没法在预览里生效（knitr在跑到某个chunk时才需要它的fig.width已经算好）
+per_item_width <- 1.5   # 每个维度分配的宽度（英寸），可按需调整
+base_width     <- 2     # 留给y轴/图例等的基础宽度
+fig_height     <- 6     # 高度统一，保证拼图时r轴刻度对齐
+```
+
+
+```{r}
+# 把除Emotional Experience外的5类的维度画在同一张图里（同一个x轴），
+# 顺序按现在的分类顺序：Perceptual Orientation -> Social Dimension -> Temporal Dimension -> Valence -> Thinking Style
+dim_order_other <- c(
+  "interoceptive", "internally focused", "externally focused", # Perceptual Orientation
+  "self focused", "other focused",                               # Social Dimension
+  "past", "present", "future",                                   # Temporal Dimension
+  "positive", "negative",                                        # Valence
+  "problem solving", "reflection", "rumination", "rating of depression"                  # Thinking Style
+)
+
+data_other_combined <- corr_llms1_cat %>%
+  filter(Category != "Emotional Experience") %>%
+  mutate(Dimension = factor(Dimension, levels = dim_order_other))
+
+p_other_combined <- plot_correlation_flipped(
+  data_other_combined,
+  value_col = "r", ylab = "Correlation (r)", title = NULL,
+  show_legend = FALSE, title_position = "top"
+)
+
+n_other_total <- length(dim_order_other)
+```
+
+```{r}
+p_other_combined
+#ggsave("corr_by_dim_OtherCombined.png", p_other_combined,
+#       width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+p_emotional2
+#ggsave("corr_by_dim_Emotional.png", p_emotional2,
+#       width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+# p_emotional2在上、p_other_combined在下，上下拼接
+p_combined_stack <- p_emotional2 / p_other_combined
+p_combined_stack
+```
+
+```{r}
+ggsave("0903corr_by_dim_Stacked.png", p_combined_stack,
+       width = 8, height = 10, dpi = 300)
+```
+
+#画图v2（被试水平）：和上面文本水平的画法完全一样，只是r值换成 corr_llms1_sub
+```{r}
+corr_llms1_sub_cat <- corr_llms1_sub %>%
+  mutate(
+    Category = case_when(
+      Dimension %in% c("interoceptive", "internally focused", "externally focused") ~ "Perceptual Orientation",
+      Dimension %in% c("self focused", "other focused") ~ "Social Dimension",
+      Dimension %in% c("past", "present", "future") ~ "Temporal Dimension",
+      Dimension %in% c("positive", "negative") ~ "Valence",
+      Dimension %in% c("problem solving", "reflection", "rumination", "rating of depression") ~ "Thinking Style",
+      TRUE ~ "Emotional Experience"
+    ),
+    Category = factor(Category, levels = category_levels_corr)
+  )
+
+data_emotional2_sub <- corr_llms1_sub_cat %>% filter(Category == "Emotional Experience")
+
+p_emotional2_sub <- plot_correlation_flipped(data_emotional2_sub, value_col = "r", ylab = "Correlation (r)", title = NULL)
+```
+
+```{r}
+data_other_combined_sub <- corr_llms1_sub_cat %>%
+  filter(Category != "Emotional Experience") %>%
+  mutate(Dimension = factor(Dimension, levels = dim_order_other))
+
+p_other_combined_sub <- plot_correlation_flipped(
+  data_other_combined_sub,
+  value_col = "r", ylab = "Correlation (r)", title = NULL,
+  show_legend = FALSE, title_position = "top"
+)
+```
+
+```{r}
+p_other_combined_sub
+```
+
+```{r}
+p_emotional2_sub
+```
+
+```{r}
+# p_emotional2_sub在上、p_other_combined_sub在下，上下拼接
+p_combined_stack_sub <- p_emotional2_sub / p_other_combined_sub
+p_combined_stack_sub
+```
+
+```{r}
+ggsave("0903corr_by_subject.png", p_combined_stack_sub,
+       width = 8, height = 10, dpi = 300)
+```
+
+
+
+#5个LLM
+```{r}
+# 只保留7个LLM的数据（去掉human和LLMs_mean）
+llms_data1 <- llm_analysis1 %>%
+  filter(Rater %in% llm_raters1)
+
+# 对每个维度计算LLMs之间的ICC
+icc_between_llms1 <- map_dfr(Eng_q_names, function(q) {
+  
+  # 宽格式：行=被试，列=各LLM
+  wide <- llms_data1 %>%
+    dplyr::select(Participant_ID, Rater, all_of(q)) %>%
+    pivot_wider(names_from = Rater, values_from = all_of(q)) %>%
+    dplyr::select(-Participant_ID) %>%
+    na.omit()
+  
+  # 计算ICC
+  result <- icc(wide, model = "twoway", type = "agreement", unit = "average")
+  
+  tibble(
+    Dimension = q,
+    ICC       = result$value,
+    p_value   = result$p.value, 
+    ICC_lower = result$lbound,
+    ICC_upper = result$ubound
+  )
+})
+```
+
+
+```{r}
+write_xlsx(icc_between_llms1, "0720icc_between_llms.xlsx")
+```
+
+
+
+```{r}
+icc_bl_perceptual <- icc_between_llms1 %>% filter(Dimension %in% dims_perceptual)
+icc_bl_emotional  <- icc_between_llms1 %>% filter(Dimension %in% dims_emotional)
+```
+
+
+
+#humans ICC
+```{r}
+humans_raw_data <- read.xlsx("D:/2025THU/SELF_OTHER/LLMRating_Task/human_raters_raw.xlsx")
+
+E_q_names <- c("rating of depression", "interoceptive", "internally focused", "externally focused", "self focused", "other focused", "positive", "negative", "problem solving", "guilt", "concern", "anger", "disgust", "fear", "sadness", "surprise", "happiness", "liking", "pleasure", "self-abasement", "disappointment", "past", "future", "present", "reflection", "rumination")
+
+names(humans_raw_data)[4:ncol(humans_raw_data)] <- E_q_names
+```
+
+
+```{r}
+icc_human <- map_dfr(E_q_names, function(q) {
+  
+  wide <- humans_raw_data %>%
+    dplyr::select(Participant_ID, rater, all_of(q)) %>%
+    pivot_wider(names_from = rater, values_from = all_of(q)) %>%
+    dplyr::select(-Participant_ID) %>%
+    mutate(across(everything(), as.numeric)) %>%  # 确保数值型
+    na.omit()
+  
+  # 用oneway，因为评分者是随机分配的，不是固定的同一批人
+  result <- icc(wide, model = "twoway", type = "agreement", unit = "average")
+  
+  tibble(
+    Dimension = q,
+    ICC       = result$value,
+    p_value   = result$p.value,
+    ICC_lower = result$lbound,
+    ICC_upper = result$ubound
+  )
+})
+
+# E_q_names 里是 "like"，Eng_q_names/icc_between_llms1 里是 "liking"，统一成 "liking" 以便和LLM的ICC结果按维度对齐
+```
+
+
+```{r}
+write_xlsx(icc_human, "icc_human.xlsx")
+```
+
+
+```{r}
+# LLM ICC vs 人类 ICC 散点图：每个点为一个维度，x=LLM评分者间ICC，y=人类评分者间ICC
+# 加对角线 y=x 作为参考：点越靠右上=双方都容易评；越靠左下=双方都难评；
+# 偏离对角线越远=LLM和人类的评分者一致性差异越大（右下=人类一致而LLM分歧大，左上=LLM反而更一致）
+icc_scatter_data <- icc_between_llms1 %>%
+  dplyr::select(Dimension, ICC_llm = ICC) %>%
+  inner_join(
+    icc_human %>% dplyr::select(Dimension, ICC_human = ICC),
+    by = "Dimension"
+  )
+
+# 按你的6类维度分组，rating of depression单独作为第7类（空心圆+黑色）
+category_levels <- c(
+  "Perceptual Orientation", "Social Dimension", "Temporal Dimension",
+  "Valence", "Thinking Style", "Emotional Experience", "Rating of Depression"
+)
+
+icc_scatter_data <- icc_scatter_data %>%
+  mutate(
+    Category = case_when(
+      Dimension == "rating of depression" ~ "Rating of Depression",
+      Dimension %in% c("interoceptive", "internally focused", "externally focused") ~ "Perceptual Orientation",
+      Dimension %in% c("self focused", "other focused") ~ "Social Dimension",
+      Dimension %in% c("past", "present", "future") ~ "Temporal Dimension",
+      Dimension %in% c("positive", "negative") ~ "Valence",
+      Dimension %in% c("problem solving", "reflection", "rumination") ~ "Thinking Style",
+      TRUE ~ "Emotional Experience"
+    ),
+    Category = factor(Category, levels = category_levels)
+  )
+
+category_colors <- c(
+  "Perceptual Orientation" = "#2a78d6",
+  "Social Dimension"       = "#1baf7a",
+  "Temporal Dimension"     = "#eda100",
+  "Valence"                = "#e87ba4",
+  "Thinking Style"         = "#4a3aa7",
+  "Emotional Experience"   = "#7B3F00",
+  "Rating of Depression"   = "#0b0b0b"
+)
+
+category_shapes <- c(
+  "Perceptual Orientation" = 16,  # 实心圆
+  "Social Dimension"       = 17,  # 实心三角
+  "Temporal Dimension"     = 15,  # 实心方块
+  "Valence"                = 18,  # 实心菱形
+  "Thinking Style"         = 8,   # 星号
+  "Emotional Experience"   = 1,   # 空心圆（棕色）
+  "Rating of Depression"   = 1    # 空心圆
+)
+
+# 标签左右交替：随机抽一半维度的标签放左边，其余放右边
+set.seed(123)
+n_dim     <- nrow(icc_scatter_data)
+left_dims <- sample(icc_scatter_data$Dimension, size = floor(n_dim / 2))
+
+# 这些维度只保留棕色空心圆圈，不显示标签文字
+no_label_dims <- c("problem solving", "disgust", "fear", "liking", "disappointment",
+                    "pleasure", "guilt", "sadness", "anger", "rumination", "happiness",
+                    "concern")
+
+icc_scatter_data <- icc_scatter_data %>%
+  mutate(
+    label_side = if_else(Dimension %in% left_dims, "left", "right"),
+    # 手动指定放左侧
+    label_side = if_else(Dimension %in% c("negative", "reflection"), "left", label_side),
+    # 手动指定放右侧
+    label_side = if_else(Dimension %in% c("future"), "right", label_side),
+    # 手动指定放左侧
+    label_side = if_else(Dimension %in% c("surprise", "internally focused"), "left", label_side),
+    hide_label = Dimension %in% no_label_dims
+  )
+
+# 标签与点之间的固定间距（数据坐标单位，和文字长短无关，可按需调整）
+label_gap <- 0.02
+
+p_icc_scatter <- ggplot(icc_scatter_data, aes(x = ICC_llm, y = ICC_human)) +
+  geom_hline(yintercept = 0.5,  linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = 0.75, linetype = "dashed", color = "gray50") +
+  geom_point(aes(color = Category, shape = Category), size = 5) +
+  geom_text(data = filter(icc_scatter_data, !hide_label, label_side == "left"),
+            aes(label = Dimension), hjust = 1, nudge_x = -label_gap,
+            size = 4, fontface = "bold") +
+  geom_text(data = filter(icc_scatter_data, !hide_label, label_side == "right"),
+            aes(label = Dimension), hjust = 0, nudge_x = label_gap,
+            size = 4, fontface = "bold") +
+  scale_color_manual(values = category_colors, breaks = category_levels) +
+  scale_shape_manual(values = category_shapes, breaks = category_levels) +
+  scale_x_continuous(breaks = seq(0.5, 1, 0.1)) +
+  scale_y_continuous(breaks = seq(0.4, 0.9, 0.1)) +
+  coord_fixed(ratio = 1, xlim = c(0.5, 1.02), ylim = c(0.4, 0.92), clip = "off") +
+  labs(x = "LLM ICC", y = "Human ICC", color = NULL, shape = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 5))) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text          = element_text(size = 12, face = "bold"),
+    axis.title         = element_text(size = 12, face = "bold"),
+    legend.position    = "bottom",
+    legend.justification = 0.4,
+    legend.key.size    = unit(1.0, "cm"),
+    legend.text        = element_text(size = 10, face = "bold"),
+    plot.margin        = margin(t = 5, r = 60, b = 5, l = 5)
+  )
+
+p_icc_scatter
+```
+
+
+```{r}
+ggsave(
+  filename = "0720ICC_LLM_vs_Human_scatter.png",
+  plot     = p_icc_scatter,
+  width    = 10,
+  height   = 9,
+  dpi      = 300
+)
+```
+
+
+
+#人口学信息
+```{r}
+
+sub_ID <- data.frame(Participant_ID = substr(llms_mean$Participant_ID, 1, 13))
+
+sub_ID <- data.frame(Participant_ID = ifelse(
+  substr(sub_ID$Participant_ID, 1, 1) == "S",
+  substr(sub_ID$Participant_ID, 1, 11),
+  ifelse(
+    substr(sub_ID$Participant_ID, 1, 1) == "5",
+    substr(sub_ID$Participant_ID, 1, 12),
+    sub_ID$Participant_ID
+  )
+))
+
+
+sub_ID$Participant_ID <- str_remove(sub_ID$Participant_ID, "_$")
+
+sub_ID <- sub_ID %>% distinct()
+```
+
+
+```{r}
+write_xlsx(sub_ID, "D:/2025THU/SELF_OTHER/LLMRating_Task/variable_description/sub_ID.xlsx")
+```
+
+
+```{r}
+# 提取 Participant_ID 的第3到第8个字符
+sub_ID$ID_only <- substr(sub_ID$Participant_ID, 3, 8)
+
+# 查看唯一值
+unique_ids <- unique(sub_ID$ID_only)
+
+# 输出
+print(unique_ids)
+```
+
+```{r}
+sub_ID <- read_excel("D:/2025THU/SELF_OTHER/LLMRating_Task/variable_description/sub_ID.xlsx")
+
+sub_info <- sub_ID %>%
+  select(Sub_ID, Gender, Group, Age) %>%
+  distinct(Sub_ID, .keep_all = TRUE)
+
+```
+
+
+```{r}
+sub_info_unique <- sub_info %>%
+  mutate(
+    True_ID = case_when(
+      str_starts(Sub_ID, "3_") | str_starts(Sub_ID, "4_") ~ str_remove(Sub_ID, "^[34]_"),
+      TRUE ~ Sub_ID
+    )
+  ) %>%
+  distinct(True_ID, .keep_all = TRUE)
+```
+
+```{r}
+# 提取3_和4_的True_ID各自的集合，看是否完全一致
+ids_3 <- sub_info %>%
+  filter(str_starts(Sub_ID, "3_")) %>%
+  mutate(True_ID = str_remove(Sub_ID, "^3_")) %>%
+  pull(True_ID)
+
+ids_4 <- sub_info %>%
+  filter(str_starts(Sub_ID, "4_")) %>%
+  mutate(True_ID = str_remove(Sub_ID, "^4_")) %>%
+  pull(True_ID)
+
+# 在3_中但不在4_中的被试
+setdiff(ids_3, ids_4)
+```
+
+```{r}
+sub_info_unique %>%
+  group_by(Group) %>%
+  summarise(
+    N        = n(),
+    Age_M    = round(mean(Age, na.rm = TRUE), 2),
+    Age_SD   = round(sd(Age, na.rm = TRUE), 2),
+    Age_Min  = min(Age, na.rm = TRUE),
+    Age_Max  = max(Age, na.rm = TRUE),
+    Female_N = sum(Gender == "female"),
+    Male_N   = sum(Gender == "male"),
+    Female_pct = round(Female_N / N * 100, 1)
+  )
+```
+
+
+```{r}
+sub_info_unique <- sub_info_unique %>%
+  mutate(Age = as.numeric(Age))
+# 先给每个被试打上数据集标签
+sub_info_unique <- sub_info_unique %>%
+  mutate(
+    Dataset = case_when(
+      str_starts(Sub_ID, "1_")  ~ "2019_behavior",
+      str_starts(Sub_ID, "2_")  ~ "2019_MRI",
+      str_starts(Sub_ID, "3_")  ~ "2020_dataset",
+      str_starts(Sub_ID, "5_")  ~ "suzhou_dataset",
+      str_starts(Sub_ID, "MF_") ~ "MF_dataset",
+      TRUE ~ "Other"
+    )
+  )
+
+# 按数据集汇总
+demo_table <- sub_info_unique %>%
+  group_by(Dataset) %>%
+  summarise(
+    N_sub      = n(),
+    Age        = paste0(round(mean(Age, na.rm = TRUE), 2),
+                        " (", round(sd(Age, na.rm = TRUE), 2), ")"),
+    Female_pct = paste0(sum(Gender == "female"),
+                        " (", round(sum(Gender == "female") / n() * 100, 2), "%)"),
+    MDD_pct    = paste0(sum(Group == "MDD"),
+                        " (", round(sum(Group == "MDD") / n() * 100, 2), "%)")
+  )
+
+
+```
+
+
+```{r}
+# 加Total行
+total_row <- sub_info_unique %>%
+  summarise(
+    Dataset    = "Total",
+    N_sub      = n(),
+    Age        = paste0(round(mean(Age, na.rm = TRUE), 2),
+                        " (", round(sd(Age, na.rm = TRUE), 2), ")"),
+    Female_pct = paste0(sum(Gender == "female"),
+                        " (", round(sum(Gender == "female") / n() * 100, 2), "%)"),
+    MDD_pct    = paste0(sum(Group == "MDD"),
+                        " (", round(sum(Group == "MDD") / n() * 100, 2), "%)")
+  )
+
+# 合并
+demo_table <- bind_rows(demo_table, total_row)
+
+print(demo_table)
+```
+
+#internally/externally focused：Human vs LLMs_mean（6个旗舰模型均分）相关系数，按MDD/HC分组分别计算
+```{r}
+# 复用前面已经定义好的 compute_r()，只是把输入数据先按Group切分，
+# 分别在HC和MDD子集内部计算 Human vs LLMs_mean（Qwen-3.5-27B/Gemini-3.5-Flash/Claude-Sonnet4.6/
+# GPT-5.4/GLM-5/DeepSeek-V4-Pro 6个旗舰模型均分）的Pearson r，不跨组混算
+dims_target <- c("internally focused", "externally focused")
+
+group_levels1 <- llms_analysis1 %>%
+  filter(Rater == "Human") %>%
+  distinct(Group) %>%
+  pull(Group)
+
+corr_llmsmean1_by_group <- map_dfr(group_levels1, function(g) {
+  data_g <- llms_analysis1 %>% filter(Group == g)
+
+  human_g <- data_g %>%
+    filter(Rater == "Human") %>%
+    select(Participant_ID, all_of(dims_target))
+
+  compute_r(data_g, "LLMs_mean", human_g, dims_target) %>%
+    mutate(Group = g) %>%
+    relocate(Group, .before = Dimension)
+})
+
+# 组内单独做FDR校正（2个维度 x 各组内部作为一个family）
+corr_llmsmean1_by_group <- corr_llmsmean1_by_group %>%
+  group_by(Group) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH"), sig_fdr = p_fdr < 0.05) %>%
+  ungroup()
+
+corr_llmsmean1_by_group
+```
+
+```{r}
+write_xlsx(corr_llmsmean1_by_group, "D:/2025THU/SELF_OTHER/LLMRating_Task/corr_llmsmean1_internally_externally_by_group.xlsx")
+```
+
+#internally/externally focused：Human 和 LLMs_mean 各自的评分标准差（SD），按MDD/HC分组分别计算
+```{r}
+sd_by_group1 <- llms_analysis1 %>%
+  filter(Rater %in% c("Human", "LLMs_mean")) %>%
+  select(Participant_ID, Group, Rater, all_of(dims_target)) %>%
+  pivot_longer(cols = all_of(dims_target), names_to = "Dimension", values_to = "score") %>%
+  group_by(Group, Rater, Dimension) %>%
+  summarise(
+    mean = mean(score, na.rm = TRUE),
+    sd   = sd(score, na.rm = TRUE),
+    n    = sum(!is.na(score)),
+    .groups = "drop"
+  ) %>%
+  arrange(Dimension, Rater, Group)
+
+sd_by_group1
+```
+
+```{r}
+write_xlsx(sd_by_group1, "D:/2025THU/SELF_OTHER/LLMRating_Task/sd_llmsmean1_internally_externally_by_group.xlsx")
+```
+
+#internally/externally focused：人类评分者间信度（ICC），按MDD/HC分组分别计算
+```{r}
+# humans_raw_data 本身没有 Group 列，用 Participant_ID 从 llms_analysis1 里关联进来
+participant_group1 <- llms_analysis1 %>%
+  filter(Rater == "Human") %>%
+  distinct(Participant_ID, Group)
+
+humans_raw_data_grp <- humans_raw_data %>%
+  inner_join(participant_group1, by = "Participant_ID")
+
+# 检查有没有匹配不上Group、被inner_join丢掉的行（应为0）
+nrow(humans_raw_data) - nrow(humans_raw_data_grp)
+```
+
+```{r}
+icc_human_by_group <- map_dfr(group_levels1, function(g) {
+  map_dfr(dims_target, function(q) {
+    wide <- humans_raw_data_grp %>%
+      filter(Group == g) %>%
+      dplyr::select(Participant_ID, rater, all_of(q)) %>%
+      pivot_wider(names_from = rater, values_from = all_of(q)) %>%
+      dplyr::select(-Participant_ID) %>%
+      mutate(across(everything(), as.numeric)) %>%
+      na.omit()
+
+    result <- icc(wide, model = "twoway", type = "agreement", unit = "average")
+
+    tibble(
+      Group      = g,
+      Dimension  = q,
+      ICC        = result$value,
+      p_value    = result$p.value,
+      ICC_lower  = result$lbound,
+      ICC_upper  = result$ubound,
+      n_segments = nrow(wide)
+    )
+  })
+})
+
+icc_human_by_group
+```
+
+```{r}
+write_xlsx(icc_human_by_group, "D:/2025THU/SELF_OTHER/LLMRating_Task/icc_human_internally_externally_by_group.xlsx")
+```
+
+
+
+
+
+
+
+
